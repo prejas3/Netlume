@@ -16,3 +16,4 @@ npm run tauri:dev
 ```
 
 The desktop app requests administrator privileges because the finished limiter will manage system network traffic.
+Release builds request elevation; engine development that needs packet access must run from an elevated terminal. Mock-data `tauri:dev` runs unelevated for UI work.
