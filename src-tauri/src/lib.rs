@@ -13,7 +13,7 @@ use std::{
 use model::{AppStat, Global, Limit, GLOBAL_EVENT, STATS_EVENT};
 use storage::{Rules, Storage};
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State, WindowEvent,
 };
@@ -145,6 +145,79 @@ fn apply_rules(stats: &mut [AppStat], rules: &Rules) {
     }
 }
 
+const TASK: &str = "Netlume";
+const AUTOSTART_ARG: &str = "--autostart";
+
+fn schtasks(args: &[&str]) -> std::io::Result<bool> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Ok(std::process::Command::new("schtasks")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()?
+        .status
+        .success())
+}
+
+fn autostart_enabled() -> bool {
+    schtasks(&["/Query", "/TN", TASK]).unwrap_or(false)
+}
+
+/// Logon task at highest privileges: elevated start with no UAC prompt. XML, not schtasks flags,
+/// because flag-made tasks die after 72 h and skip on battery.
+fn set_autostart(on: bool) -> Result<(), String> {
+    let ok = if on {
+        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+        let user = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").unwrap_or_default(),
+            std::env::var("USERNAME").map_err(|error| error.to_string())?
+        );
+        let file = std::env::temp_dir().join("netlume-task.xml");
+        let xml = task_xml(&exe.to_string_lossy(), &user);
+        let bytes: Vec<u8> = std::iter::once(0xFEFF)
+            .chain(xml.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        std::fs::write(&file, bytes).map_err(|error| error.to_string())?;
+        let path = file.to_string_lossy().into_owned();
+        let ok = schtasks(&["/Create", "/TN", TASK, "/XML", &path, "/F"]);
+        let _ = std::fs::remove_file(file);
+        ok
+    } else {
+        schtasks(&["/Delete", "/TN", TASK, "/F"])
+    };
+    match ok {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("schtasks failed".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn task_xml(exe: &str, user: &str) -> String {
+    let escape = |text: &str| {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers><LogonTrigger><UserId>{user}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{exe}</Command><Arguments>{AUTOSTART_ARG}</Arguments></Exec></Actions>
+</Task>"#,
+        user = escape(user),
+        exe = escape(exe),
+    )
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -159,10 +232,23 @@ pub fn run() {
             *state.global.lock().map_err(|error| error.to_string())? = rules.global.clone();
             *state.rules.lock().map_err(|error| error.to_string())? = rules.clone();
             let _ = state.storage.set(storage.clone());
+            if !std::env::args().any(|arg| arg == AUTOSTART_ARG) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                }
+            }
             let open = MenuItem::with_id(app, "open", "Open Netlume", true, None::<&str>)?;
             let pause = MenuItem::with_id(app, "pause", "Pause all limits", true, None::<&str>)?;
+            let start = CheckMenuItem::with_id(
+                app,
+                "autostart",
+                "Start with Windows",
+                true,
+                autostart_enabled(),
+                None::<&str>,
+            )?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &pause, &quit])?;
+            let menu = Menu::with_items(app, &[&open, &pause, &start, &quit])?;
             let icon = app
                 .default_window_icon()
                 .cloned()
@@ -171,7 +257,14 @@ pub fn run() {
             TrayIconBuilder::new()
                 .icon(icon)
                 .menu(&menu)
-                .on_menu_event(|app, event| match event.id.as_ref() {
+                .on_menu_event(move |app, event| match event.id.as_ref() {
+                    "autostart" => {
+                        let on = autostart_enabled();
+                        if let Err(error) = set_autostart(!on) {
+                            eprintln!("autostart: {error}");
+                        }
+                        let _ = start.set_checked(autostart_enabled());
+                    }
                     "open" => {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
@@ -262,5 +355,14 @@ mod tests {
 
         assert_eq!(stats[0].limit.as_ref().unwrap().down_bps, Some(1_000_000));
         assert!(stats[0].blocked);
+    }
+
+    #[test]
+    fn autostart_task_is_elevated_unbounded_and_escaped() {
+        let xml = task_xml(r"C:\A&B\netlume.exe", r"PC\me");
+        assert!(xml.contains(r"<Command>C:\A&amp;B\netlume.exe</Command>"));
+        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains(&format!("<Arguments>{AUTOSTART_ARG}</Arguments>")));
     }
 }

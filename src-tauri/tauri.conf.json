@@ -16,7 +16,8 @@
         "width": 1000,
         "height": 700,
         "minWidth": 760,
-        "minHeight": 520
+        "minHeight": 520,
+        "visible": false
       }
     ],
     "security": {
@@ -24,6 +25,24 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "windivert/WinDivert.dll": "WinDivert.dll",
+      "windivert/WinDivert64.sys": "WinDivert64.sys",
+      "windivert/LICENSE": "WinDivert-LICENSE.txt",
+      "../THIRD_PARTY.md": "THIRD_PARTY.md"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "windows/hooks.nsh"
+      }
+    }
   }
 }
