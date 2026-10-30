@@ -15,5 +15,7 @@ npm install
 npm run tauri:dev
 ```
 
+Packet capture uses [WinDivert 2.2.2](https://github.com/basil00/WinDivert) (LGPL-3.0, loaded dynamically, not in git): run `src-tauri/windivert.ps1` to fetch the signed x64 `WinDivert.dll` and `WinDivert64.sys` into `src-tauri/windivert/`, then put that folder on `PATH`. Microsoft Defender may flag WinDivert as unwanted software.
+
 The desktop app requests administrator privileges because the finished limiter will manage system network traffic.
 Release builds request elevation; engine development that needs packet access must run from an elevated terminal. Mock-data `tauri:dev` runs unelevated for UI work.

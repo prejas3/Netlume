@@ -4,3 +4,4 @@ dist/
 .hive/
 .agents/
 src-tauri/gen/
+src-tauri/windivert/
