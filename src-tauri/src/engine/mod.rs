@@ -180,6 +180,9 @@ pub struct Engine {
     owners: Mutex<HashMap<(u8, u16), u32>>,
     /// pid → [down, up] bytes passed since the last tick; pid 0 = unknown.
     traffic: Mutex<HashMap<u32, [u64; 2]>>,
+    /// pid → exe path, taken when its flow opens, so exited processes keep their name.
+    /// ponytail: never pruned; a reused pid is overwritten by its first new flow.
+    paths: Mutex<HashMap<u32, String>>,
     /// ponytail: one shaped pid until #152 brings per-app limits.
     pub target: AtomicU32,
 }
@@ -201,9 +204,15 @@ impl Engine {
     pub fn tick(&self, apps: &mut BTreeMap<String, AppStat>) -> Vec<AppStat> {
         *self.owners.lock().unwrap() = port_owners();
         let traffic = std::mem::take(&mut *self.traffic.lock().unwrap());
-        let by_path = traffic
-            .into_iter()
-            .map(|(pid, bytes)| (exe_path(pid).unwrap_or_else(|| SYSTEM.into()), bytes));
+        let mut paths = self.paths.lock().unwrap();
+        let by_path = traffic.into_iter().map(|(pid, bytes)| {
+            let path = paths.get(&pid).cloned().or_else(|| {
+                let path = exe_path(pid)?;
+                paths.insert(pid, path.clone());
+                Some(path)
+            });
+            (path.unwrap_or_else(|| SYSTEM.into()), bytes)
+        });
         merge(apps, by_path)
     }
 }
@@ -316,6 +325,12 @@ pub fn start(limits: [Option<u64>; 2]) -> io::Result<Arc<Engine>> {
         let mut addr: Addr = unsafe { std::mem::zeroed() };
         while recv(fh, &mut [], &mut 0, &mut addr) {
             on_flow(&mut flows.flows.lock().unwrap(), &addr);
+            let pid = addr.flow().0;
+            if addr.event() == EVENT_FLOW_ESTABLISHED {
+                if let Some(path) = exe_path(pid) {
+                    flows.paths.lock().unwrap().insert(pid, path);
+                }
+            }
         }
     });
 
@@ -501,6 +516,8 @@ mod tests {
         let (cpu0, t0) = (cpu_seconds(), Instant::now());
         thread::sleep(Duration::from_secs(10));
         let idle = (cpu_seconds() - cpu0) / t0.elapsed().as_secs_f64();
+        let traffic = engine.traffic.lock().unwrap().clone();
+        println!("IDLE unknown (pid 0) {:?}, System (pid 4) {:?}", traffic.get(&0), traffic.get(&4));
         let seen = engine.tick(&mut apps);
         for app in &seen {
             println!("IDLE {:>10} B down {:>10} B up  {}", app.down_total, app.up_total, app.path);
