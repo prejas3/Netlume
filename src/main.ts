@@ -90,6 +90,7 @@ document.body.innerHTML = `
     </section>
   </main>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div class="scroll-thumb" aria-hidden="true"></div>
 `;
 
 const byId = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;

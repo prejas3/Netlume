@@ -113,8 +113,13 @@
   }
   .global-limit-panel {
     position: absolute; inset-block-start: calc(100% + 10px); inset-inline-end: 0;
-    z-index: 10; inline-size: min(630px, 80vw);
+    z-index: 10; inline-size: min(440px, calc(100vw - 48px));
+    display: grid; grid-template-columns: 1fr auto 1fr auto; align-items: end; gap: 10px; padding: 16px 18px;
+    background: var(--raised); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow);
   }
+  .global-limit-panel .limit-form-copy { grid-column: 1 / -1; }
+  .global-limit-panel .off-button { grid-column: 3; justify-self: end; }
+  .global-limit-panel .save-limit { grid-column: 4; }
   .traffic-rail { block-size: 3px; margin-block-start: 32px; background: var(--line); overflow: hidden; }
   .traffic-rail span {
     display: block; inline-size: var(--traffic, 12%); block-size: 100%;
@@ -189,11 +194,10 @@
   .block-toggle.is-blocked i { background: var(--coral); }
   .block-toggle.is-blocked i::after { translate: 11px; }
 
-  .limit-editor, .global-limit-panel {
+  .limit-editor {
     display: grid; grid-template-columns: minmax(160px, 1.3fr) 100px auto 100px auto auto auto;
     align-items: end; gap: 10px; padding: 16px 22px; background: var(--raised); border-block-end: 1px solid var(--line);
   }
-  .global-limit-panel { border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
   .limit-form-copy { align-self: center; display: grid; gap: 4px; }
   .limit-form-copy strong { font-size: 12px; }
   .limit-form-copy span { color: var(--muted); font-size: 10px; }
@@ -238,7 +242,19 @@
   .toast.is-visible { opacity: 1; translate: 0; }
   .toast.is-error { background: var(--coral); }
   button:focus-visible, a:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
-  * { scrollbar-width: thin; scrollbar-color: color-mix(in oklab, var(--muted) 40%, transparent) transparent; }
+  /* No native scrollbars (custom controls only): a thumb driven by the page's scroll, CSS only.
+     ponytail: indicator, not draggable; wheel/keys scroll. Add drag if anyone misses it. */
+  * { scrollbar-width: none; }
+  html { overflow-x: clip; }
+  .scroll-thumb {
+    position: fixed; inset: 0 3px auto auto; z-index: 40; inline-size: 4px; block-size: 64px;
+    border-radius: 4px; background: color-mix(in oklab, var(--muted) 55%, transparent);
+    opacity: 0; pointer-events: none; animation: scroll-thumb linear both; animation-timeline: scroll(root block);
+  }
+  @keyframes scroll-thumb {
+    from { opacity: 1; translate: 0 4px; }
+    to { opacity: 1; translate: 0 calc(100dvh - 68px); }
+  }
 }
 
 @layer responsive {
@@ -249,10 +265,10 @@
       grid-template-columns: minmax(200px, 1.7fr) minmax(95px, .8fr) minmax(95px, .8fr) minmax(115px, 1fr) minmax(90px, .7fr);
     }
     .table-head > :nth-child(4), .app-row > :nth-child(4) { display: none; }
-    .limit-editor, .global-limit-panel { grid-template-columns: 1fr 90px auto 90px auto; }
-    .limit-editor .limit-form-copy, .global-limit-panel .limit-form-copy { grid-column: 1 / -1; }
-    .off-button { grid-column: 4; }
-    .save-limit { grid-column: 5; }
+    .limit-editor { grid-template-columns: 1fr 90px auto 90px auto; }
+    .limit-editor .limit-form-copy { grid-column: 1 / -1; }
+    .limit-editor .off-button { grid-column: 4; }
+    .limit-editor .save-limit { grid-column: 5; }
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
