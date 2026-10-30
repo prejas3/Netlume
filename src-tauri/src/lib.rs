@@ -1,13 +1,17 @@
 mod engine;
 pub mod model;
+mod storage;
 
 use std::{
+    collections::BTreeMap,
+    path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
     thread,
     time::Duration,
 };
 
 use model::{AppStat, Global, Limit, GLOBAL_EVENT, STATS_EVENT};
+use storage::{Rules, Storage};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -17,12 +21,17 @@ use tauri::{
 #[derive(Default)]
 struct AppState {
     global: Mutex<Global>,
-    /// Unset when the engine can't start (unelevated UI dev): commands are then no-ops.
+    rules: Mutex<Rules>,
+    storage: OnceLock<Arc<Storage>>,
+    /// Unset when the engine can't start (unelevated UI dev): commands still persist.
     engine: OnceLock<Arc<engine::Engine>>,
 }
 
 #[tauri::command]
 fn set_limit(path: String, limit: Limit, state: State<'_, AppState>) -> Result<(), String> {
+    let mut rules = state.rules.lock().map_err(|error| error.to_string())?;
+    rules.apps.entry(path.clone()).or_default().limit = limit.clone();
+    save_rules(&state, &rules)?;
     if let Some(engine) = state.engine.get() {
         engine.set_limit(path, limit);
     }
@@ -31,6 +40,9 @@ fn set_limit(path: String, limit: Limit, state: State<'_, AppState>) -> Result<(
 
 #[tauri::command]
 fn set_block(path: String, blocked: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let mut rules = state.rules.lock().map_err(|error| error.to_string())?;
+    rules.apps.entry(path.clone()).or_default().blocked = blocked;
+    save_rules(&state, &rules)?;
     if let Some(engine) = state.engine.get() {
         engine.set_block(path, blocked);
     }
@@ -40,6 +52,9 @@ fn set_block(path: String, blocked: bool, state: State<'_, AppState>) -> Result<
 #[tauri::command]
 fn set_global(global: Global, state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
     *state.global.lock().map_err(|error| error.to_string())? = global.clone();
+    let mut rules = state.rules.lock().map_err(|error| error.to_string())?;
+    rules.global = global.clone();
+    save_rules(&state, &rules)?;
     if let Some(engine) = state.engine.get() {
         engine.set_global(global.clone());
     }
@@ -49,56 +64,68 @@ fn set_global(global: Global, state: State<'_, AppState>, app: AppHandle) -> Res
 }
 
 #[tauri::command]
-fn history(_day: String) -> Vec<AppStat> {
-    mock_stats(0)
+fn get_global(state: State<'_, AppState>) -> Result<Global, String> {
+    state
+        .global
+        .lock()
+        .map(|global| global.clone())
+        .map_err(|error| error.to_string())
 }
 
-fn mock_stats(tick: u64) -> Vec<AppStat> {
-    vec![
-        AppStat {
-            id: "browser".into(),
-            name: "Web Browser".into(),
-            path: r"C:\Program Files\Browser\browser.exe".into(),
-            down_bps: 840_000 + tick % 80_000,
-            up_bps: 52_000,
-            down_total: 128_000_000 + tick * 840_000,
-            up_total: 8_000_000 + tick * 52_000,
-            limit: None,
-            blocked: false,
-        },
-        AppStat {
-            id: "chat".into(),
-            name: "Chat".into(),
-            path: r"C:\Program Files\Chat\chat.exe".into(),
-            down_bps: 18_000,
-            up_bps: 11_000,
-            down_total: 5_000_000 + tick * 18_000,
-            up_total: 2_000_000 + tick * 11_000,
-            limit: None,
-            blocked: false,
-        },
-    ]
+#[tauri::command]
+fn history(day: String, state: State<'_, AppState>) -> Result<Vec<AppStat>, String> {
+    state
+        .storage
+        .get()
+        .ok_or("storage unavailable")?
+        .history(&day)
+        .map_err(|error| error.to_string())
 }
 
-fn emit_stats(app: AppHandle, engine: std::sync::Arc<engine::Engine>) {
+fn save_rules(state: &AppState, rules: &Rules) -> Result<(), String> {
+    state
+        .storage
+        .get()
+        .ok_or("storage unavailable")?
+        .save_rules(rules)
+        .map_err(|error| error.to_string())
+}
+
+fn today() -> String {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        weekday: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        millis: u16,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocalTime(time: *mut SystemTime);
+    }
+    let mut time = SystemTime::default();
+    unsafe { GetLocalTime(&mut time) };
+    format!("{:04}-{:02}-{:02}", time.year, time.month, time.day)
+}
+
+fn emit_stats(app: AppHandle, engine: Arc<engine::Engine>, storage: Arc<Storage>) {
     thread::spawn(move || {
-        let mut apps = std::collections::BTreeMap::new();
+        let mut apps = BTreeMap::new();
+        let mut ticks = 0;
         loop {
             thread::sleep(Duration::from_secs(1));
-            if app.emit(STATS_EVENT, engine.tick(&mut apps)).is_err() {
-                break;
+            let stats = engine.tick(&mut apps);
+            let _ = storage.record(&today(), &stats);
+            ticks += 1;
+            if ticks % 60 == 0 {
+                let _ = storage.flush();
             }
-        }
-    });
-}
-
-fn emit_mock_stats(app: AppHandle) {
-    thread::spawn(move || {
-        let mut tick = 0;
-        loop {
-            thread::sleep(Duration::from_secs(1));
-            tick += 1;
-            if app.emit(STATS_EVENT, mock_stats(tick)).is_err() {
+            if app.emit(STATS_EVENT, stats).is_err() {
                 break;
             }
         }
@@ -109,6 +136,16 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .setup(|app| {
+            let root = std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .ok_or("APPDATA is unavailable")?
+                .join("Netlume");
+            let storage = Arc::new(Storage::new(root)?);
+            let rules = storage.load_rules().unwrap_or_default();
+            let state = app.state::<AppState>();
+            *state.global.lock().map_err(|error| error.to_string())? = rules.global.clone();
+            *state.rules.lock().map_err(|error| error.to_string())? = rules.clone();
+            let _ = state.storage.set(storage.clone());
             let open = MenuItem::with_id(app, "open", "Open Netlume", true, None::<&str>)?;
             let pause = MenuItem::with_id(app, "pause", "Pause all limits", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -135,24 +172,40 @@ pub fn run() {
                                 if let Some(engine) = state.engine.get() {
                                     engine.set_global(global.clone());
                                 }
+                                if let Ok(mut rules) = state.rules.lock() {
+                                    rules.global = global.clone();
+                                    if let Some(storage) = state.storage.get() {
+                                        let _ = storage.save_rules(&rules);
+                                    }
+                                }
                                 let _ = app.emit(GLOBAL_EVENT, global.clone());
                             }
                         }
                     }
-                    "quit" => app.exit(0),
+                    "quit" => {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            if let Some(storage) = state.storage.get() {
+                                let _ = storage.flush();
+                            }
+                        }
+                        app.exit(0)
+                    }
                     _ => {}
                 })
                 .build(app)?;
 
-            // ponytail: no admin or no WinDivert (UI dev) → mock stats, so the UI still runs.
             match engine::start() {
                 Ok(engine) => {
+                    for (path, rule) in &rules.apps {
+                        engine.set_limit(path.clone(), rule.limit.clone());
+                        engine.set_block(path.clone(), rule.blocked);
+                    }
+                    engine.set_global(rules.global);
                     let _ = app.state::<AppState>().engine.set(engine.clone());
-                    emit_stats(app.handle().clone(), engine);
+                    emit_stats(app.handle().clone(), engine, storage);
                 }
                 Err(error) => {
-                    eprintln!("engine off, mock stats: {error}");
-                    emit_mock_stats(app.handle().clone());
+                    eprintln!("engine off: {error}");
                 }
             }
             Ok(())
@@ -166,22 +219,8 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            set_limit, set_block, set_global, history
+            set_limit, set_block, set_global, get_global, history
         ])
         .run(tauri::generate_context!())
         .expect("error while running Netlume");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mock_stats_match_contract() {
-        let stats = mock_stats(3);
-        assert_eq!(stats.len(), 2);
-        assert!(stats
-            .iter()
-            .all(|stat| !stat.id.is_empty() && !stat.path.is_empty()));
-    }
 }

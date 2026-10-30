@@ -135,6 +135,10 @@ void listen<Global>("global", ({ payload }) => {
   state.paused = payload.paused; state.limits.set("global", payload.limit);
   byId("globalLimitText").textContent = formatLimit(payload.limit); renderPause();
 });
+void invoke<Global>("get_global").then((global) => {
+  state.paused = global.paused; state.limits.set("global", global.limit);
+  byId("globalLimitText").textContent = formatLimit(global.limit); renderPause();
+}).catch(() => showToast("Could not load saved settings", true));
 
 function setView(view: View) {
   state.view = view;
