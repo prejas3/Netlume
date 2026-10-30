@@ -3,11 +3,11 @@ pub mod model;
 
 use std::{sync::Mutex, thread, time::Duration};
 
-use model::{AppStat, Global, Limit};
+use model::{AppStat, Global, Limit, GLOBAL_EVENT, STATS_EVENT};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, State,
+    AppHandle, Emitter, Manager, State, WindowEvent,
 };
 
 #[derive(Default)]
@@ -26,8 +26,10 @@ fn set_block(_path: String, _blocked: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_global(global: Global, state: State<'_, AppState>) -> Result<(), String> {
-    *state.global.lock().map_err(|error| error.to_string())? = global;
+fn set_global(global: Global, state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    *state.global.lock().map_err(|error| error.to_string())? = global.clone();
+    app.emit(GLOBAL_EVENT, global)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -69,7 +71,7 @@ fn emit_mock_stats(app: AppHandle) {
         loop {
             thread::sleep(Duration::from_secs(1));
             tick += 1;
-            if app.emit("stats", mock_stats(tick)).is_err() {
+            if app.emit(STATS_EVENT, mock_stats(tick)).is_err() {
                 break;
             }
         }
@@ -103,6 +105,7 @@ pub fn run() {
                         if let Some(state) = app.try_state::<AppState>() {
                             if let Ok(mut global) = state.global.lock() {
                                 global.paused = !global.paused;
+                                let _ = app.emit(GLOBAL_EVENT, global.clone());
                             }
                         }
                     }
@@ -113,6 +116,14 @@ pub fn run() {
 
             emit_mock_stats(app.handle().clone());
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             set_limit, set_block, set_global, history

@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import "./style.css";
 
 type Limit = { down_bps: number | null; up_bps: number | null };
+type Global = { limit: Limit; paused: boolean };
 type AppStat = {
   id: string; name: string; path: string; down_bps: number; up_bps: number;
   down_total: number; up_total: number; limit: Limit | null; blocked: boolean;
@@ -130,6 +131,10 @@ void listen<AppStat[]>("stats", ({ payload }) => {
   state.apps = payload; renderLiveSummary();
   if (state.openEditor === null) renderApps();
 });
+void listen<Global>("global", ({ payload }) => {
+  state.paused = payload.paused; state.limits.set("global", payload.limit);
+  byId("globalLimitText").textContent = formatLimit(payload.limit); renderPause();
+});
 
 function setView(view: View) {
   state.view = view;
@@ -166,7 +171,7 @@ function createAppRow(app: AppStat) {
   const blocked = state.blocked.get(app.path) ?? app.blocked;
   const limit = state.limits.get(app.path) ?? app.limit;
   row.innerHTML = `
-    <div class="app-identity" role="cell"><span class="app-icon">${initials(app.name)}</span><span><strong></strong><small></small></span></div>
+    <div class="app-identity" role="cell"><span class="app-icon"></span><span><strong></strong><small></small></span></div>
     <strong class="metric down-metric" role="cell">${formatRate(app.down_bps)}</strong>
     <strong class="metric" role="cell">${formatRate(app.up_bps)}</strong>
     <span class="metric total" role="cell">${formatBytes(app.down_total + app.up_total)}</span>
@@ -174,6 +179,7 @@ function createAppRow(app: AppStat) {
     <div role="cell"><button class="block-toggle ${blocked ? "is-blocked" : ""}" role="switch" aria-checked="${blocked}"><i></i><span>${blocked ? "Blocked" : "Allowed"}</span></button></div>`;
   row.querySelector(".app-identity strong")!.textContent = app.name;
   row.querySelector(".app-identity small")!.textContent = compactPath(app.path);
+  row.querySelector(".app-icon")!.textContent = initials(app.name);
   row.querySelector<HTMLButtonElement>(".limit-button")!.addEventListener("click", () => {
     state.openEditor = state.openEditor === app.path ? null : app.path; renderApps();
   });
@@ -271,9 +277,11 @@ function renderHistory() {
   byId("historyCount").textContent = `${state.historyApps.length} applications recorded`;
   historyRows.replaceChildren(...[...state.historyApps].sort((a, b) => b.down_total + b.up_total - a.down_total - a.up_total).map((app) => {
     const row = document.createElement("div"); row.className = "history-row";
-    row.innerHTML = `<span class="app-icon">${initials(app.name)}</span><span class="history-app"><strong></strong><small></small></span><span><small>Downloaded</small><strong>${formatBytes(app.down_total)}</strong></span><span><small>Uploaded</small><strong>${formatBytes(app.up_total)}</strong></span>`;
+    row.innerHTML = `<span class="app-icon"></span><span class="history-app"><strong></strong><small></small></span><span><small>Downloaded</small><strong>${formatBytes(app.down_total)}</strong></span><span><small>Uploaded</small><strong>${formatBytes(app.up_total)}</strong></span>`;
     row.querySelector(".history-app strong")!.textContent = app.name;
-    row.querySelector(".history-app small")!.textContent = compactPath(app.path); return row;
+    row.querySelector(".history-app small")!.textContent = compactPath(app.path);
+    row.querySelector(".app-icon")!.textContent = initials(app.name);
+    return row;
   }));
 }
 

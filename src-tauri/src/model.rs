@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+pub const STATS_EVENT: &str = "stats";
+pub const GLOBAL_EVENT: &str = "global";
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Limit {
     pub down_bps: Option<u64>,
