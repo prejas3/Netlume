@@ -1,4 +1,4 @@
-//! CCS/1 engine: WinDivert FLOW layer → (proto, local port) → pid; NETWORK layer → token-bucket shaping.
+//! CCS/1 engine: WinDivert FLOW layer → 5-tuple → pid; NETWORK layer → token-bucket shaping.
 //! ponytail: #150 spike shapes one target pid; #151 adds stats, #152 per-app/global limits + block.
 #![allow(dead_code)] // ponytail: wired into the app by #151
 
@@ -6,6 +6,7 @@ use std::{
     collections::{HashMap, VecDeque},
     ffi::CString,
     io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, Condvar, Mutex,
@@ -40,12 +41,28 @@ impl Addr {
         self.bits >> 17 & 1 == 1
     }
 
-    /// FLOW layer data: pid @16, local port @52, protocol @56 (host order).
-    fn flow(&self) -> (u32, (u8, u16)) {
+    /// FLOW layer data, host order: pid @16, local addr @20, remote addr @36, ports @52/@54, protocol @56.
+    fn flow(&self) -> (u32, Key) {
         let b: &[u8; 64] = unsafe { &*(self.data.as_ptr() as *const [u8; 64]) };
+        let u16_at = |i: usize| u16::from_ne_bytes([b[i], b[i + 1]]);
         let pid = u32::from_ne_bytes([b[16], b[17], b[18], b[19]]);
-        (pid, (b[56], u16::from_ne_bytes([b[52], b[53]])))
+        (pid, (b[56], flow_ip(&b[20..36]), u16_at(52), flow_ip(&b[36..52]), u16_at(54)))
     }
+}
+
+/// (protocol, local ip, local port, remote ip, remote port).
+pub type Key = (u8, IpAddr, u16, IpAddr, u16);
+
+/// WinDivert host-order IPv6 = words reversed, each native-endian; IPv4 arrives IPv4-mapped.
+fn flow_ip(b: &[u8]) -> IpAddr {
+    let mut ip = [0u8; 16];
+    for i in 0..4 {
+        let j = 12 - 4 * i;
+        let word = u32::from_ne_bytes([b[j], b[j + 1], b[j + 2], b[j + 3]]);
+        ip[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    let ip = Ipv6Addr::from(ip);
+    ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4)
 }
 
 type Handle = isize;
@@ -117,38 +134,47 @@ pub fn exe_path(pid: u32) -> Option<String> {
     }
 }
 
-/// (protocol, local port) → pid.
+/// 5-tuple → pid.
 /// ponytail: flows opened before start are unknown; #151 seeds them from GetExtendedTcp/UdpTable.
-pub type Flows = Arc<Mutex<HashMap<(u8, u16), u32>>>;
+pub type Flows = Arc<Mutex<HashMap<Key, u32>>>;
 
 pub fn track_flows(flows: Flows) -> io::Result<()> {
     let h = open("not loopback and (tcp or udp)", LAYER_FLOW, FLAG_SNIFF | FLAG_RECV_ONLY)?;
     thread::spawn(move || {
         let mut addr: Addr = unsafe { std::mem::zeroed() };
         while recv(h, &mut [], &mut 0, &mut addr) {
-            let (pid, key) = addr.flow();
-            let mut flows = flows.lock().unwrap();
-            match addr.event() {
-                EVENT_FLOW_ESTABLISHED => flows.insert(key, pid),
-                EVENT_FLOW_DELETED => flows.remove(&key),
-                _ => None,
-            };
+            on_flow(&mut flows.lock().unwrap(), &addr);
         }
     });
     Ok(())
 }
 
-/// (protocol, local port) of an IPv4/IPv6 TCP/UDP packet.
+fn on_flow(flows: &mut HashMap<Key, u32>, addr: &Addr) {
+    let (pid, key) = addr.flow();
+    match addr.event() {
+        EVENT_FLOW_ESTABLISHED => flows.insert(key, pid),
+        EVENT_FLOW_DELETED => flows.remove(&key),
+        _ => None,
+    };
+}
+
+/// 5-tuple of an IPv4/IPv6 TCP/UDP packet, local side first.
 /// ponytail: IPv6 extension headers not walked; such packets pass unshaped.
-fn packet_key(p: &[u8], outbound: bool) -> Option<(u8, u16)> {
-    let (proto, off) = match p.first()? >> 4 {
-        4 => (*p.get(9)?, (p[0] & 15) as usize * 4),
-        6 => (*p.get(6)?, 40),
+fn packet_key(p: &[u8], outbound: bool) -> Option<Key> {
+    let (proto, off, src, dst): (u8, usize, IpAddr, IpAddr) = match p.first()? >> 4 {
+        4 => {
+            let (a, b): ([u8; 4], [u8; 4]) = (p.get(12..16)?.try_into().ok()?, p.get(16..20)?.try_into().ok()?);
+            (p[9], (p[0] & 15) as usize * 4, Ipv4Addr::from(a).into(), Ipv4Addr::from(b).into())
+        }
+        6 => {
+            let (a, b): ([u8; 16], [u8; 16]) = (p.get(8..24)?.try_into().ok()?, p.get(24..40)?.try_into().ok()?);
+            (p[6], 40, Ipv6Addr::from(a).into(), Ipv6Addr::from(b).into())
+        }
         _ => return None,
     };
     let ports = p.get(off..off + 4)?;
-    let port = if outbound { [ports[0], ports[1]] } else { [ports[2], ports[3]] };
-    Some((proto, u16::from_be_bytes(port)))
+    let (sport, dport) = (u16::from_be_bytes([ports[0], ports[1]]), u16::from_be_bytes([ports[2], ports[3]]));
+    Some(if outbound { (proto, src, sport, dst, dport) } else { (proto, dst, dport, src, sport) })
 }
 
 /// Debt token bucket: a packet goes whenever tokens >= 0, so packets larger than the burst never stall.
@@ -278,15 +304,56 @@ mod tests {
         assert!(bucket.take(1, t0 + w).is_zero());
     }
 
-    #[test]
-    fn packet_key_reads_local_port() {
-        let mut p = [0u8; 28];
+    /// FLOW-layer Addr in WinDivert's host-order, IPv4-mapped form.
+    fn flow_addr(event: u8, pid: u32, local: [u8; 4], lport: u16, remote: [u8; 4], rport: u16) -> Addr {
+        let mut addr: Addr = unsafe { std::mem::zeroed() };
+        addr.bits = (event as u32) << 8;
+        let b: &mut [u8; 64] = unsafe { &mut *(addr.data.as_mut_ptr() as *mut [u8; 64]) };
+        b[16..20].copy_from_slice(&pid.to_ne_bytes());
+        for (at, ip) in [(20, local), (36, remote)] {
+            b[at..at + 4].copy_from_slice(&u32::from_be_bytes(ip).to_ne_bytes());
+            b[at + 4..at + 8].copy_from_slice(&0xffffu32.to_ne_bytes());
+        }
+        b[52..54].copy_from_slice(&lport.to_ne_bytes());
+        b[54..56].copy_from_slice(&rport.to_ne_bytes());
+        b[56] = 6;
+        addr
+    }
+
+    fn tcp4(src: [u8; 4], sport: u16, dst: [u8; 4], dport: u16) -> [u8; 24] {
+        let mut p = [0u8; 24];
         p[0] = 0x45;
-        p[9] = 17;
-        p[20..24].copy_from_slice(&[0x1f, 0x90, 0x00, 0x35]); // 8080 → 53
-        assert_eq!(packet_key(&p, true), Some((17, 8080)));
-        assert_eq!(packet_key(&p, false), Some((17, 53)));
-        assert_eq!(packet_key(&p[..22], true), None);
+        p[9] = 6;
+        p[12..16].copy_from_slice(&src);
+        p[16..20].copy_from_slice(&dst);
+        p[20..22].copy_from_slice(&sport.to_be_bytes());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn flows_keep_remotes_on_one_local_port_apart() {
+        let (me, a, b) = ([10, 0, 0, 2], [1, 1, 1, 1], [8, 8, 8, 8]);
+        let mut flows = HashMap::new();
+        on_flow(&mut flows, &flow_addr(EVENT_FLOW_ESTABLISHED, 100, me, 5000, a, 443));
+        on_flow(&mut flows, &flow_addr(EVENT_FLOW_ESTABLISHED, 200, me, 5000, b, 443));
+        let pid = |p: &[u8], out| packet_key(p, out).and_then(|k| flows.get(&k).copied());
+        assert_eq!(pid(&tcp4(a, 443, me, 5000), false), Some(100));
+        assert_eq!(pid(&tcp4(me, 5000, b, 443), true), Some(200));
+
+        on_flow(&mut flows, &flow_addr(EVENT_FLOW_DELETED, 100, me, 5000, a, 443));
+        assert_eq!(flows.len(), 1);
+        assert_eq!(packet_key(&tcp4(b, 443, me, 5000), false).and_then(|k| flows.get(&k).copied()), Some(200));
+        assert_eq!(packet_key(&tcp4(a, 443, me, 5000)[..22], false), None);
+    }
+
+    #[test]
+    fn flow_ip_reads_host_order_ipv6() {
+        let mut b = [0u8; 16];
+        for (i, word) in [1u32, 0, 0, 0x2001_0db8].iter().enumerate() {
+            b[4 * i..4 * i + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        assert_eq!(flow_ip(&b), "2001:db8::1".parse::<IpAddr>().unwrap());
     }
 
     /// Elevated: `src-tauri/windivert.ps1`, PATH += src-tauri/windivert, then
