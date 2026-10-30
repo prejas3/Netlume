@@ -2,7 +2,7 @@
 
 Open-source per-application network monitor and bandwidth limiter for Windows 10 and 11.
 
-![Netlume](docs/screenshot.png)
+![Netlume](docs/screenshot.jpg)
 
 ## Install
 
