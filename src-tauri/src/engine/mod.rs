@@ -1,17 +1,14 @@
 //! CCS/1 engine: WinDivert FLOW layer → 5-tuple → pid; NETWORK layer → per-app counts + token-bucket shaping.
-//! ponytail: shapes one target pid; #152 brings per-app/global limits + block.
+//! Limits per exe path + global, block, pause; rules in memory (persistence #154).
 
-use crate::model::AppStat;
+use crate::model::{AppStat, Global, Limit};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     ffi::CString,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc, Condvar, Mutex,
-    },
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -183,11 +180,35 @@ pub struct Engine {
     /// pid → exe path, taken when its flow opens, so exited processes keep their name.
     /// ponytail: never pruned; a reused pid is overwritten by its first new flow.
     paths: Mutex<HashMap<u32, String>>,
-    /// ponytail: one shaped pid until #152 brings per-app limits.
-    pub target: AtomicU32,
+    shaper: Mutex<Shaper<Packet>>,
+    /// Wakes the release thread when packets queue or rules change.
+    wake: Condvar,
 }
 
 impl Engine {
+    /// Limits apply to every pid of the exe path.
+    pub fn set_limit(&self, path: String, limit: Limit) {
+        self.shaper.lock().unwrap().set_limit(path, limit, Instant::now());
+        self.wake.notify_one();
+    }
+
+    /// Blocked = its packets are dropped (queued ones too).
+    pub fn set_block(&self, path: String, blocked: bool) {
+        self.shaper.lock().unwrap().set_block(path, blocked);
+    }
+
+    /// Global limit applies to all traffic on top of app limits; paused lifts all limits, blocks stay.
+    pub fn set_global(&self, global: Global) {
+        self.shaper.lock().unwrap().set_global(global, Instant::now());
+        self.wake.notify_one();
+    }
+
+    /// pid → exe path, cached; unresolvable (pid 0/4, exited, denied) → SYSTEM.
+    fn path(&self, pid: u32) -> String {
+        let mut paths = self.paths.lock().unwrap();
+        paths.entry(pid).or_insert_with(|| exe_path(pid).unwrap_or_else(|| SYSTEM.into())).clone()
+    }
+
     fn pid(&self, key: Option<Key>) -> u32 {
         let Some(key) = key else { return 0 };
         let flow = self.flows.lock().unwrap().get(&key).copied();
@@ -204,23 +225,21 @@ impl Engine {
     pub fn tick(&self, apps: &mut BTreeMap<String, AppStat>) -> Vec<AppStat> {
         *self.owners.lock().unwrap() = port_owners();
         let traffic = std::mem::take(&mut *self.traffic.lock().unwrap());
-        let mut paths = self.paths.lock().unwrap();
-        let by_path = traffic.into_iter().map(|(pid, bytes)| {
-            let path = paths.get(&pid).cloned().or_else(|| {
-                let path = exe_path(pid)?;
-                paths.insert(pid, path.clone());
-                Some(path)
-            });
-            (path.unwrap_or_else(|| SYSTEM.into()), bytes)
-        });
-        merge(apps, by_path)
+        merge(apps, traffic.into_iter().map(|(pid, bytes)| (self.path(pid), bytes)));
+        let shaper = self.shaper.lock().unwrap();
+        for app in apps.values_mut() {
+            let rule = shaper.apps.get(&app.path);
+            app.limit = rule.map(|rule| rule.limit.clone()).filter(|l| l.down_bps.is_some() || l.up_bps.is_some());
+            app.blocked = rule.is_some_and(|rule| rule.blocked);
+        }
+        apps.values().cloned().collect()
     }
 }
 
 /// Path of the bucket for System (pid 4), unknown flows and exited processes.
 const SYSTEM: &str = "System";
 
-fn merge(apps: &mut BTreeMap<String, AppStat>, traffic: impl Iterator<Item = (String, [u64; 2])>) -> Vec<AppStat> {
+fn merge(apps: &mut BTreeMap<String, AppStat>, traffic: impl Iterator<Item = (String, [u64; 2])>) {
     for app in apps.values_mut() {
         app.down_bps = 0;
         app.up_bps = 0;
@@ -245,7 +264,6 @@ fn merge(apps: &mut BTreeMap<String, AppStat>, traffic: impl Iterator<Item = (St
         app.down_total += down;
         app.up_total += up;
     }
-    apps.values().cloned().collect()
 }
 
 fn on_flow(flows: &mut HashMap<Key, u32>, addr: &Addr) {
@@ -291,30 +309,141 @@ impl Bucket {
         Self { rate, burst, tokens: burst, last: now }
     }
 
-    /// Zero = send now (tokens taken); otherwise how long until it may go.
-    pub fn take(&mut self, len: usize, now: Instant) -> Duration {
+    /// Zero = a packet may go now; otherwise how long until it may.
+    pub fn ready(&mut self, now: Instant) -> Duration {
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
         self.last = now;
         if self.tokens < 0.0 {
             return Duration::from_secs_f64(-self.tokens / self.rate).max(Duration::from_nanos(1));
         }
-        self.tokens -= len as f64;
         Duration::ZERO
+    }
+
+    pub fn spend(&mut self, len: usize) {
+        self.tokens -= len as f64;
     }
 }
 
-struct Lane {
-    bucket: Bucket,
-    queue: VecDeque<(Vec<u8>, Addr, u32)>,
-    bytes: usize,
-    cap: usize,
+fn buckets(limit: &Limit, now: Instant) -> [Option<Bucket>; 2] {
+    [limit.down_bps, limit.up_bps].map(|rate| rate.filter(|&r| r > 0).map(|r| Bucket::new(r, now)))
 }
 
-/// Starts attribution, counting and shaping of `target`; limits = [down, up] bytes/s, None = unshaped.
+#[derive(Default)]
+struct Rule {
+    limit: Limit,
+    blocked: bool,
+    buckets: [Option<Bucket>; 2],
+}
+
+/// Per-app + global shaping; a packet must pass its app bucket and the global bucket.
+/// Generic over the queued item so it is testable without WinDivert.
+struct Shaper<T> {
+    apps: HashMap<String, Rule>,
+    global: Global,
+    global_buckets: [Option<Bucket>; 2],
+    /// (path, direction) → FIFO of (len, item), queued bytes. Index 0 = down, 1 = up.
+    lanes: HashMap<(String, usize), (VecDeque<(usize, T)>, usize)>,
+    /// Round-robin position in `lanes`.
+    turn: usize,
+}
+
+impl<T> Default for Shaper<T> {
+    fn default() -> Self {
+        Self { apps: HashMap::new(), global: Global::default(), global_buckets: [None, None], lanes: HashMap::new(), turn: 0 }
+    }
+}
+
+impl<T> Shaper<T> {
+    /// Some = send now; None = queued, or dropped (blocked, or queue full).
+    /// ponytail: queue tail-drops past 0.5 s of data so TCP backs off instead of bloating RTT.
+    fn admit(&mut self, path: &str, dir: usize, len: usize, item: T, now: Instant) -> Option<T> {
+        let rule = self.apps.get_mut(path);
+        if rule.as_ref().is_some_and(|rule| rule.blocked) {
+            return None;
+        }
+        if self.global.paused {
+            return Some(item);
+        }
+        let app = rule.and_then(|rule| rule.buckets[dir].as_mut());
+        let global = self.global_buckets[dir].as_mut();
+        let rate = app.iter().chain(global.iter()).map(|b| b.rate).reduce(f64::min);
+        let Some(rate) = rate else { return Some(item) };
+        let (queue, bytes) = self.lanes.entry((path.to_string(), dir)).or_default();
+        if queue.is_empty() {
+            let mut buckets: Vec<&mut Bucket> = app.into_iter().chain(global).collect();
+            if buckets.iter_mut().all(|b| b.ready(now).is_zero()) {
+                buckets.iter_mut().for_each(|b| b.spend(len));
+                return Some(item);
+            }
+        }
+        if *bytes + len > ((rate / 2.0) as usize).max(65_536) {
+            return None;
+        }
+        *bytes += len;
+        queue.push_back((len, item));
+        None
+    }
+
+    /// Items that may go now, round-robin across apps, and how long until the next one may.
+    fn release(&mut self, now: Instant) -> (Vec<T>, Option<Duration>) {
+        let (mut out, mut wait) = (Vec::new(), None::<Duration>);
+        let keys: Vec<(String, usize)> = self.lanes.keys().cloned().collect();
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for i in 0..keys.len() {
+                // Start after the lane served last, so one app can't take every token under a global cap.
+                let idx = (self.turn + i) % keys.len();
+                let (path, dir) = &keys[idx];
+                let (queue, bytes) = self.lanes.get_mut(&keys[idx]).unwrap();
+                let Some(&(len, _)) = queue.front() else { continue };
+                let app = self.apps.get_mut(path).and_then(|rule| rule.buckets[*dir].as_mut());
+                let global = self.global_buckets[*dir].as_mut();
+                let mut buckets: Vec<&mut Bucket> = if self.global.paused {
+                    Vec::new()
+                } else {
+                    app.into_iter().chain(global).collect()
+                };
+                let w = buckets.iter_mut().map(|b| b.ready(now)).max().unwrap_or_default();
+                if !w.is_zero() {
+                    wait = Some(wait.map_or(w, |wait| wait.min(w)));
+                    continue;
+                }
+                buckets.iter_mut().for_each(|b| b.spend(len));
+                *bytes -= len;
+                out.push(queue.pop_front().unwrap().1);
+                self.turn = idx + 1;
+                progress = true;
+            }
+        }
+        (out, wait)
+    }
+
+    fn set_limit(&mut self, path: String, limit: Limit, now: Instant) {
+        let rule = self.apps.entry(path).or_default();
+        rule.buckets = buckets(&limit, now);
+        rule.limit = limit;
+    }
+
+    fn set_block(&mut self, path: String, blocked: bool) {
+        if blocked {
+            self.lanes.retain(|(lane, _), _| *lane != path);
+        }
+        self.apps.entry(path).or_default().blocked = blocked;
+    }
+
+    fn set_global(&mut self, global: Global, now: Instant) {
+        self.global_buckets = buckets(&global.limit, now);
+        self.global = global;
+    }
+}
+
+type Packet = (Vec<u8>, Addr, u32);
+
+/// Starts attribution, counting and limiting (rules via Engine::set_*).
 /// ponytail: all non-loopback TCP/UDP is diverted through this process; it exiting releases the driver.
-/// ponytail: queue tail-drops past 0.5 s of data so TCP backs off instead of bloating RTT.
-pub fn start(limits: [Option<u64>; 2]) -> io::Result<Arc<Engine>> {
+pub fn start() -> io::Result<Arc<Engine>> {
     let engine = Arc::new(Engine::default());
     let fh = open("not loopback and (tcp or udp)", LAYER_FLOW, FLAG_SNIFF | FLAG_RECV_ONLY)?;
     *engine.owners.lock().unwrap() = port_owners();
@@ -334,61 +463,40 @@ pub fn start(limits: [Option<u64>; 2]) -> io::Result<Arc<Engine>> {
         }
     });
 
-    let now = Instant::now();
-    let lanes = limits.map(|limit| {
-        limit.map(|rate| Lane {
-            bucket: Bucket::new(rate, now),
-            queue: VecDeque::new(),
-            bytes: 0,
-            cap: (rate as usize / 2).max(65_536),
-        })
-    });
-    let shared = Arc::new((Mutex::new(lanes), Condvar::new()));
-
-    let (rx, rx_engine) = (shared.clone(), engine.clone());
+    let rx = engine.clone();
     thread::spawn(move || {
-        let engine = rx_engine;
         let mut buf = vec![0u8; 65_535];
         let mut addr: Addr = unsafe { std::mem::zeroed() };
         let mut len = 0u32;
         while recv(h, &mut buf, &mut len, &mut addr) {
             let packet = &buf[..len as usize];
-            let pid = engine.pid(packet_key(packet, addr.outbound()));
-            let mut lanes = rx.0.lock().unwrap();
-            match &mut lanes[addr.outbound() as usize] {
-                Some(lane) if pid != 0 && pid == engine.target.load(Ordering::Relaxed) => {
-                    if lane.bytes + packet.len() <= lane.cap {
-                        lane.bytes += packet.len();
-                        lane.queue.push_back((packet.to_vec(), addr, pid));
-                        rx.1.notify_one();
-                    }
-                }
-                _ => engine.pass(h, packet, &addr, pid),
+            let pid = rx.pid(packet_key(packet, addr.outbound()));
+            let path = rx.path(pid);
+            let item = (packet.to_vec(), addr, pid);
+            let admitted = rx.shaper.lock().unwrap().admit(&path, addr.outbound() as usize, len as usize, item, Instant::now());
+            match admitted {
+                Some((packet, addr, pid)) => rx.pass(h, &packet, &addr, pid),
+                None => rx.wake.notify_one(),
             }
         }
     });
 
-    let tx_engine = engine.clone();
+    let tx = engine.clone();
     thread::spawn(move || {
-        let engine = tx_engine;
-        let mut lanes = shared.0.lock().unwrap();
+        let mut shaper = tx.shaper.lock().unwrap();
         loop {
-            let mut wait = None::<Duration>;
-            for lane in lanes.iter_mut().flatten() {
-                while let Some((packet, ..)) = lane.queue.front() {
-                    let w = lane.bucket.take(packet.len(), Instant::now());
-                    if !w.is_zero() {
-                        wait = Some(wait.map_or(w, |wait| wait.min(w)));
-                        break;
-                    }
-                    let (packet, addr, pid) = lane.queue.pop_front().unwrap();
-                    lane.bytes -= packet.len();
-                    engine.pass(h, &packet, &addr, pid);
+            let (out, wait) = shaper.release(Instant::now());
+            if !out.is_empty() {
+                drop(shaper);
+                for (packet, addr, pid) in out {
+                    tx.pass(h, &packet, &addr, pid);
                 }
+                shaper = tx.shaper.lock().unwrap();
+                continue;
             }
-            lanes = match wait {
-                Some(wait) => shared.1.wait_timeout(lanes, wait).unwrap().0,
-                None => shared.1.wait(lanes).unwrap(),
+            shaper = match wait {
+                Some(wait) => tx.wake.wait_timeout(shaper, wait).unwrap().0,
+                None => tx.wake.wait(shaper).unwrap(),
             };
         }
     });
@@ -399,13 +507,93 @@ pub fn start(limits: [Option<u64>; 2]) -> io::Result<Arc<Engine>> {
 mod tests {
     use super::*;
 
+    fn take(bucket: &mut Bucket, len: usize, now: Instant) -> Duration {
+        let w = bucket.ready(now);
+        if w.is_zero() {
+            bucket.spend(len);
+        }
+        w
+    }
+
+    fn limit(down: u64) -> Limit {
+        Limit { down_bps: Some(down), up_bps: None }
+    }
+
+    /// Apps each offer 1500 B down per ms (1.5 MB/s) for `secs`; returns bytes passed per app.
+    fn simulate(shaper: &mut Shaper<&'static str>, apps: &[&'static str], secs: u64) -> HashMap<&'static str, usize> {
+        let (t0, mut passed) = (Instant::now(), HashMap::new());
+        for ms in 0..secs * 1000 {
+            let now = t0 + Duration::from_millis(ms);
+            for &app in apps {
+                if let Some(app) = shaper.admit(app, 0, 1500, app, now) {
+                    *passed.entry(app).or_default() += 1500;
+                }
+            }
+            for app in shaper.release(now).0 {
+                *passed.entry(app).or_default() += 1500;
+            }
+        }
+        passed
+    }
+
+    fn near(actual: usize, expected: f64, tolerance: f64) -> bool {
+        (actual as f64 / expected - 1.0).abs() <= tolerance
+    }
+
+    #[test]
+    fn shaper_app_limit_and_global_cap() {
+        let now = Instant::now();
+        let mut shaper = Shaper::default();
+        shaper.set_limit("a".into(), limit(300_000), now);
+        let passed = simulate(&mut shaper, &["a", "b"], 10);
+        assert!(near(passed["a"], 3_000_000.0, 0.05), "a {}", passed["a"]);
+        assert!(near(passed["b"], 15_000_000.0, 0.01), "b unlimited {}", passed["b"]);
+
+        let mut shaper = Shaper::default();
+        shaper.set_global(Global { limit: limit(600_000), paused: false }, now);
+        let passed = simulate(&mut shaper, &["a", "b"], 10);
+        assert!(near(passed["a"] + passed["b"], 6_000_000.0, 0.05), "{passed:?}");
+        assert!(near(passed["a"], 3_000_000.0, 0.2), "global shared fairly {passed:?}");
+
+        let mut shaper = Shaper::default();
+        shaper.set_global(Global { limit: limit(600_000), paused: false }, now);
+        shaper.set_limit("a".into(), limit(100_000), now);
+        let passed = simulate(&mut shaper, &["a", "b"], 10);
+        assert!(near(passed["a"], 1_000_000.0, 0.05), "{passed:?}");
+        assert!(near(passed["b"], 5_000_000.0, 0.05), "b gets the rest {passed:?}");
+    }
+
+    #[test]
+    fn shaper_block_pause_and_unlimit() {
+        let now = Instant::now();
+        let mut shaper = Shaper::default();
+        shaper.set_limit("a".into(), limit(100_000), now);
+        shaper.set_block("b".into(), true);
+        let passed = simulate(&mut shaper, &["a", "b"], 1);
+        assert!(!passed.contains_key("b"), "blocked app passed");
+
+        shaper.set_global(Global { limit: limit(100_000), paused: true }, now);
+        let passed = simulate(&mut shaper, &["a", "b"], 1);
+        assert!(passed["a"] >= 1_500_000, "pause lifts limits (and drains the queue)");
+        assert!(!passed.contains_key("b"), "pause keeps blocks");
+
+        let mut shaper = Shaper::default();
+        shaper.set_limit("a".into(), limit(16_384), now);
+        for _ in 0..30 {
+            shaper.admit("a", 0, 1500, "a", now);
+        }
+        assert!(shaper.release(now).0.is_empty());
+        shaper.set_limit("a".into(), Limit::default(), now);
+        assert_eq!(shaper.release(now).0.len(), 30 - 11, "queued packets drain once unlimited");
+    }
+
     #[test]
     fn bucket_holds_rate_over_time() {
         let t0 = Instant::now();
         let mut bucket = Bucket::new(100_000, t0);
         let (mut t, mut sent) = (t0, 0usize);
         while t < t0 + Duration::from_secs(10) {
-            match bucket.take(1500, t) {
+            match take(&mut bucket, 1500, t) {
                 w if w.is_zero() => sent += 1500,
                 w => t += w,
             }
@@ -419,10 +607,10 @@ mod tests {
     fn bucket_never_stalls_on_jumbo_packet() {
         let t0 = Instant::now();
         let mut bucket = Bucket::new(1000, t0);
-        assert!(bucket.take(64_000, t0).is_zero());
-        let w = bucket.take(1, t0);
+        assert!(take(&mut bucket, 64_000, t0).is_zero());
+        let w = take(&mut bucket, 1, t0);
         assert!((w.as_secs_f64() - (64_000.0 - 16_384.0) / 1000.0).abs() < 1e-6);
-        assert!(bucket.take(1, t0 + w).is_zero());
+        assert!(take(&mut bucket, 1, t0 + w).is_zero());
     }
 
     #[test]
@@ -430,8 +618,8 @@ mod tests {
         let mut apps = BTreeMap::new();
         let exe = r"C:\Apps\Browser.exe".to_string();
         let tick1 = [(exe.clone(), [100, 10]), (exe.clone(), [50, 5]), (SYSTEM.into(), [7, 0])];
-        let stats = merge(&mut apps, tick1.into_iter());
-        assert_eq!(stats.len(), 2);
+        merge(&mut apps, tick1.into_iter());
+        assert_eq!(apps.len(), 2);
         let browser = &apps[&exe];
         assert_eq!((browser.name.as_str(), browser.down_bps, browser.up_bps), ("Browser", 150, 15));
         assert_eq!(apps[SYSTEM].name, "System / unknown");
@@ -502,81 +690,73 @@ mod tests {
     }
 
     /// Elevated: `src-tauri/windivert.ps1`, PATH += src-tauri/windivert, then
-    /// `cargo test --lib spike -- --ignored --nocapture`.
+    /// `cargo test --release --lib spike -- --ignored --nocapture`.
     #[test]
     #[ignore = "needs admin, WinDivert files on PATH, internet"]
-    fn spike_download_shaping() {
-        const LIMIT: f64 = 1_000_000.0;
-        const URL: &str = "https://speed.cloudflare.com/__down?bytes=20000000";
-        let engine = start([Some(LIMIT as u64), None]).unwrap();
-        let (flows, target) = (&engine.flows, &engine.target);
+    fn spike_engine_live() {
+        const MB: f64 = 1_000_000.0;
+        const CURL: &str = r"C:\Windows\System32\curl.exe";
+        let curl2 = std::env::temp_dir().join("netlume-curl2.exe");
+        std::fs::copy(CURL, &curl2).unwrap();
+        let curl2 = curl2.to_string_lossy().into_owned();
+        let engine = start().unwrap();
         let mut apps = BTreeMap::new();
 
         // Idle cost + what the monitor sees over 10 s of normal background traffic.
         let (cpu0, t0) = (cpu_seconds(), Instant::now());
         thread::sleep(Duration::from_secs(10));
         let idle = (cpu_seconds() - cpu0) / t0.elapsed().as_secs_f64();
-        let traffic = engine.traffic.lock().unwrap().clone();
-        println!("IDLE unknown (pid 0) {:?}, System (pid 4) {:?}", traffic.get(&0), traffic.get(&4));
-        let seen = engine.tick(&mut apps);
-        for app in &seen {
+        for app in engine.tick(&mut apps) {
             println!("IDLE {:>10} B down {:>10} B up  {}", app.down_total, app.up_total, app.path);
         }
 
-        let curl = |shaped: bool| {
-            let child = std::process::Command::new("curl.exe")
-                .args(["-s", "-o", "NUL", "-w", "%{speed_download} %{time_total} %{time_starttransfer}", URL])
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            let pid = child.id();
-            if shaped {
-                target.store(pid, Ordering::Relaxed);
+        let curl = |exe: &str, bytes: u64, max_secs: u32| {
+            let url = format!("https://speed.cloudflare.com/__down?bytes={bytes}");
+            let max = max_secs.to_string();
+            let args = ["-s", "-o", "NUL", "--max-time", &max, "-w", "%{size_download}", &url];
+            let child = std::process::Command::new(exe).args(args).stdout(std::process::Stdio::piped()).spawn().unwrap();
+            let t0 = Instant::now();
+            move || {
+                let out = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+                (out.trim().parse::<f64>().unwrap(), t0.elapsed().as_secs_f64())
             }
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !flows.lock().unwrap().values().any(|&p| p == pid) && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(5));
-            }
-            let attributed = flows.lock().unwrap().values().any(|&p| p == pid);
-            let path = exe_path(pid);
-            let out = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
-            let v: Vec<f64> = out.split_whitespace().map(|s| s.parse().unwrap()).collect();
-            (v[0], v[1], v[2], attributed, path)
         };
+        let rate = |(bytes, secs): (f64, f64)| bytes / secs;
 
         let (cpu0, t0) = (cpu_seconds(), Instant::now());
-        let base = curl(false);
+        let base = rate(curl(CURL, 20_000_000, 60)());
         let full = (cpu_seconds() - cpu0) / t0.elapsed().as_secs_f64();
-        let curl_total = engine
-            .tick(&mut apps)
-            .into_iter()
-            .find(|app| app.path.to_lowercase().ends_with("curl.exe"))
-            .map_or(0, |app| app.down_total);
-        let (cpu0, t0) = (cpu_seconds(), Instant::now());
-        let shaped = curl(true);
-        let cpu = (cpu_seconds() - cpu0) / t0.elapsed().as_secs_f64();
-        let cores = thread::available_parallelism().map_or(1, |n| n.get());
-        println!(
-            "MONITOR curl counted {curl_total} B down for a 20,000,000 B body; CPU idle {:.2}% / full speed {:.1}% of one core",
-            idle * 100.0,
-            full * 100.0,
-        );
-        println!(
-            "SPIKE base {:.0} B/s; shaped {:.0} B/s = {:+.1}% vs {LIMIT} limit, total {:.1}s, ttfb {:.2}s; \
-             attributed {} {:?}; engine CPU {:.1}% of one core ({:.2}% of {cores})",
-            base.0,
-            shaped.0,
-            (shaped.0 / LIMIT - 1.0) * 100.0,
-            shaped.1,
-            shaped.2,
-            shaped.3,
-            shaped.4,
-            cpu * 100.0,
-            cpu * 100.0 / cores as f64,
-        );
-        assert!(shaped.3, "curl flow not attributed");
-        assert!((20_000_000..22_000_000).contains(&curl_total), "monitor miscounted curl");
-        assert!((shaped.0 / LIMIT - 1.0).abs() <= 0.2, "rate off by more than 20%");
+        let counted = engine.tick(&mut apps).into_iter().find(|app| app.path == CURL).map_or(0, |app| app.down_total);
+
+        engine.set_limit(CURL.into(), limit(MB as u64));
+        let limited = rate(curl(CURL, 10_000_000, 60)());
+
+        engine.set_global(Global { limit: Limit::default(), paused: true });
+        let paused = rate(curl(CURL, 20_000_000, 60)());
+        engine.set_global(Global::default());
+
+        engine.set_block(CURL.into(), true);
+        let blocked = curl(CURL, 1_000_000, 5)().0;
+        engine.set_block(CURL.into(), false);
+        engine.set_limit(CURL.into(), Limit::default());
+
+        engine.set_global(Global { limit: limit(2 * MB as u64), paused: false });
+        let t0 = Instant::now();
+        let (a, b) = (curl(CURL, 10_000_000, 60), curl(&curl2, 10_000_000, 60));
+        let (a, b) = (a().0, b().0);
+        let global = (a + b) / t0.elapsed().as_secs_f64();
+        let both = engine.tick(&mut apps).into_iter().filter(|app| app.path == CURL || app.path == curl2).count();
+        engine.set_global(Global::default());
+
+        println!("MONITOR curl counted {counted} B for 20,000,000 B; CPU idle {:.2}% / full speed {:.1}% of one core", idle * 100.0, full * 100.0);
+        println!("LIMIT base {:.0} B/s; app 1 MB/s → {:.0} B/s ({:+.1}%); paused → {:.0} B/s", base, limited, (limited / MB - 1.0) * 100.0, paused);
+        println!("BLOCK {blocked} B in 5 s; GLOBAL 2 MB/s, two apps → {:.0} B/s ({:+.1}%), a {a} B b {b} B, both listed {}", global, (global / (2.0 * MB) - 1.0) * 100.0, both == 2);
+        assert!((20_000_000..22_000_000).contains(&counted), "monitor miscounted curl");
+        assert!((limited / MB - 1.0).abs() <= 0.2, "app limit off");
+        assert!(paused > 3.0 * MB, "pause did not lift the limit");
+        assert_eq!(blocked, 0.0, "block let bytes through");
+        assert!((global / (2.0 * MB) - 1.0).abs() <= 0.2, "global cap off");
+        assert_eq!(both, 2, "second app not attributed");
     }
 
     fn cpu_seconds() -> f64 {

@@ -1,7 +1,11 @@
 mod engine;
 pub mod model;
 
-use std::{sync::Mutex, thread, time::Duration};
+use std::{
+    sync::{Arc, Mutex, OnceLock},
+    thread,
+    time::Duration,
+};
 
 use model::{AppStat, Global, Limit, GLOBAL_EVENT, STATS_EVENT};
 use tauri::{
@@ -13,21 +17,32 @@ use tauri::{
 #[derive(Default)]
 struct AppState {
     global: Mutex<Global>,
+    /// Unset when the engine can't start (unelevated UI dev): commands are then no-ops.
+    engine: OnceLock<Arc<engine::Engine>>,
 }
 
 #[tauri::command]
-fn set_limit(_path: String, _limit: Limit) -> Result<(), String> {
+fn set_limit(path: String, limit: Limit, state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(engine) = state.engine.get() {
+        engine.set_limit(path, limit);
+    }
     Ok(())
 }
 
 #[tauri::command]
-fn set_block(_path: String, _blocked: bool) -> Result<(), String> {
+fn set_block(path: String, blocked: bool, state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(engine) = state.engine.get() {
+        engine.set_block(path, blocked);
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn set_global(global: Global, state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
     *state.global.lock().map_err(|error| error.to_string())? = global.clone();
+    if let Some(engine) = state.engine.get() {
+        engine.set_global(global.clone());
+    }
     app.emit(GLOBAL_EVENT, global)
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -117,6 +132,9 @@ pub fn run() {
                         if let Some(state) = app.try_state::<AppState>() {
                             if let Ok(mut global) = state.global.lock() {
                                 global.paused = !global.paused;
+                                if let Some(engine) = state.engine.get() {
+                                    engine.set_global(global.clone());
+                                }
                                 let _ = app.emit(GLOBAL_EVENT, global.clone());
                             }
                         }
@@ -127,8 +145,11 @@ pub fn run() {
                 .build(app)?;
 
             // ponytail: no admin or no WinDivert (UI dev) → mock stats, so the UI still runs.
-            match engine::start([None, None]) {
-                Ok(engine) => emit_stats(app.handle().clone(), engine),
+            match engine::start() {
+                Ok(engine) => {
+                    let _ = app.state::<AppState>().engine.set(engine.clone());
+                    emit_stats(app.handle().clone(), engine);
+                }
                 Err(error) => {
                     eprintln!("engine off, mock stats: {error}");
                     emit_mock_stats(app.handle().clone());
