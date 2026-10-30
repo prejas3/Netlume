@@ -65,6 +65,18 @@ fn mock_stats(tick: u64) -> Vec<AppStat> {
     ]
 }
 
+fn emit_stats(app: AppHandle, engine: std::sync::Arc<engine::Engine>) {
+    thread::spawn(move || {
+        let mut apps = std::collections::BTreeMap::new();
+        loop {
+            thread::sleep(Duration::from_secs(1));
+            if app.emit(STATS_EVENT, engine.tick(&mut apps)).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn emit_mock_stats(app: AppHandle) {
     thread::spawn(move || {
         let mut tick = 0;
@@ -114,7 +126,14 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            emit_mock_stats(app.handle().clone());
+            // ponytail: no admin or no WinDivert (UI dev) → mock stats, so the UI still runs.
+            match engine::start([None, None]) {
+                Ok(engine) => emit_stats(app.handle().clone(), engine),
+                Err(error) => {
+                    eprintln!("engine off, mock stats: {error}");
+                    emit_mock_stats(app.handle().clone());
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

@@ -1,12 +1,13 @@
-//! CCS/1 engine: WinDivert FLOW layer → 5-tuple → pid; NETWORK layer → token-bucket shaping.
-//! ponytail: #150 spike shapes one target pid; #151 adds stats, #152 per-app/global limits + block.
-#![allow(dead_code)] // ponytail: wired into the app by #151
+//! CCS/1 engine: WinDivert FLOW layer → 5-tuple → pid; NETWORK layer → per-app counts + token-bucket shaping.
+//! ponytail: shapes one target pid; #152 brings per-app/global limits + block.
 
+use crate::model::AppStat;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::CString,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::Path,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc, Condvar, Mutex,
@@ -134,19 +135,108 @@ pub fn exe_path(pid: u32) -> Option<String> {
     }
 }
 
-/// 5-tuple → pid.
-/// ponytail: flows opened before start are unknown; #151 seeds them from GetExtendedTcp/UdpTable.
-pub type Flows = Arc<Mutex<HashMap<Key, u32>>>;
+#[link(name = "iphlpapi")]
+extern "system" {
+    fn GetExtendedTcpTable(table: *mut u8, size: *mut u32, order: i32, af: u32, class: u32, reserved: u32) -> u32;
+    fn GetExtendedUdpTable(table: *mut u8, size: *mut u32, order: i32, af: u32, class: u32, reserved: u32) -> u32;
+}
 
-pub fn track_flows(flows: Flows) -> io::Result<()> {
-    let h = open("not loopback and (tcp or udp)", LAYER_FLOW, FLAG_SNIFF | FLAG_RECV_ONLY)?;
-    thread::spawn(move || {
-        let mut addr: Addr = unsafe { std::mem::zeroed() };
-        while recv(h, &mut [], &mut 0, &mut addr) {
-            on_flow(&mut flows.lock().unwrap(), &addr);
+/// (protocol, local port) → pid from the OS TCP/UDP owner tables (IPv4 + IPv6).
+fn port_owners() -> HashMap<(u8, u16), u32> {
+    type Get = unsafe extern "system" fn(*mut u8, *mut u32, i32, u32, u32, u32) -> u32;
+    let mut owners = HashMap::new();
+    // (proto, get, AF, class, row size, port @, pid @): MIB_{TCP,TCP6,UDP,UDP6}ROW_OWNER_PID.
+    let tables: [(u8, Get, u32, u32, usize, usize, usize); 4] = [
+        (6, GetExtendedTcpTable, 2, 5, 24, 8, 20),
+        (6, GetExtendedTcpTable, 23, 5, 56, 20, 52),
+        (17, GetExtendedUdpTable, 2, 1, 12, 4, 8),
+        (17, GetExtendedUdpTable, 23, 1, 28, 20, 24),
+    ];
+    for (proto, get, af, class, row, port_at, pid_at) in tables {
+        let mut size = 0u32;
+        unsafe { get(std::ptr::null_mut(), &mut size, 0, af, class, 0) };
+        size += 4096; // room for sockets opened between the two calls
+        let mut buf = vec![0u32; size as usize / 4];
+        if unsafe { get(buf.as_mut_ptr().cast(), &mut size, 0, af, class, 0) } != 0 {
+            continue;
         }
-    });
-    Ok(())
+        let b: Vec<u8> = buf.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        for r in (0..buf[0] as usize).map(|i| 4 + i * row).take_while(|r| r + row <= b.len()) {
+            let port = u16::from_be_bytes([b[r + port_at], b[r + port_at + 1]]);
+            let pid = u32::from_ne_bytes([b[r + pid_at], b[r + pid_at + 1], b[r + pid_at + 2], b[r + pid_at + 3]]);
+            owners.insert((proto, port), pid);
+        }
+    }
+    owners
+}
+
+/// Live engine state shared by its threads and the app.
+#[derive(Default)]
+pub struct Engine {
+    /// 5-tuple → pid from FLOW events.
+    pub flows: Mutex<HashMap<Key, u32>>,
+    /// Fallback for flows opened before start, refreshed each tick.
+    /// ponytail: port-only, so a UDP port shared by two apps can misattribute; FLOW events win.
+    owners: Mutex<HashMap<(u8, u16), u32>>,
+    /// pid → [down, up] bytes passed since the last tick; pid 0 = unknown.
+    traffic: Mutex<HashMap<u32, [u64; 2]>>,
+    /// ponytail: one shaped pid until #152 brings per-app limits.
+    pub target: AtomicU32,
+}
+
+impl Engine {
+    fn pid(&self, key: Option<Key>) -> u32 {
+        let Some(key) = key else { return 0 };
+        let flow = self.flows.lock().unwrap().get(&key).copied();
+        flow.or_else(|| self.owners.lock().unwrap().get(&(key.0, key.2)).copied()).unwrap_or(0)
+    }
+
+    /// Reinjects a packet and counts it for its pid (counted on send, so shaper drops don't count).
+    fn pass(&self, h: Handle, packet: &[u8], addr: &Addr, pid: u32) {
+        self.traffic.lock().unwrap().entry(pid).or_default()[addr.outbound() as usize] += packet.len() as u64;
+        send(h, packet, addr);
+    }
+
+    /// Call once a second: rates = bytes since the last tick, totals for the session, per exe path.
+    pub fn tick(&self, apps: &mut BTreeMap<String, AppStat>) -> Vec<AppStat> {
+        *self.owners.lock().unwrap() = port_owners();
+        let traffic = std::mem::take(&mut *self.traffic.lock().unwrap());
+        let by_path = traffic
+            .into_iter()
+            .map(|(pid, bytes)| (exe_path(pid).unwrap_or_else(|| SYSTEM.into()), bytes));
+        merge(apps, by_path)
+    }
+}
+
+/// Path of the bucket for System (pid 4), unknown flows and exited processes.
+const SYSTEM: &str = "System";
+
+fn merge(apps: &mut BTreeMap<String, AppStat>, traffic: impl Iterator<Item = (String, [u64; 2])>) -> Vec<AppStat> {
+    for app in apps.values_mut() {
+        app.down_bps = 0;
+        app.up_bps = 0;
+    }
+    for (path, [down, up]) in traffic {
+        let app = apps.entry(path.clone()).or_insert_with(|| AppStat {
+            id: path.clone(),
+            name: match path.as_str() {
+                SYSTEM => "System / unknown".into(),
+                _ => Path::new(&path).file_stem().map_or(path.clone(), |s| s.to_string_lossy().into()),
+            },
+            path,
+            down_bps: 0,
+            up_bps: 0,
+            down_total: 0,
+            up_total: 0,
+            limit: None,
+            blocked: false,
+        });
+        app.down_bps += down;
+        app.up_bps += up;
+        app.down_total += down;
+        app.up_total += up;
+    }
+    apps.values().cloned().collect()
 }
 
 fn on_flow(flows: &mut HashMap<Key, u32>, addr: &Addr) {
@@ -207,15 +297,28 @@ impl Bucket {
 
 struct Lane {
     bucket: Bucket,
-    queue: VecDeque<(Vec<u8>, Addr)>,
+    queue: VecDeque<(Vec<u8>, Addr, u32)>,
     bytes: usize,
     cap: usize,
 }
 
-/// Shapes the target pid's traffic; limits = [down, up] in bytes/s, None = unshaped.
+/// Starts attribution, counting and shaping of `target`; limits = [down, up] bytes/s, None = unshaped.
+/// ponytail: all non-loopback TCP/UDP is diverted through this process; it exiting releases the driver.
 /// ponytail: queue tail-drops past 0.5 s of data so TCP backs off instead of bloating RTT.
-pub fn shape(flows: Flows, target: Arc<AtomicU32>, limits: [Option<u64>; 2]) -> io::Result<()> {
+pub fn start(limits: [Option<u64>; 2]) -> io::Result<Arc<Engine>> {
+    let engine = Arc::new(Engine::default());
+    let fh = open("not loopback and (tcp or udp)", LAYER_FLOW, FLAG_SNIFF | FLAG_RECV_ONLY)?;
+    *engine.owners.lock().unwrap() = port_owners();
     let h = open("not loopback and (tcp or udp)", LAYER_NETWORK, 0)?;
+
+    let flows = engine.clone();
+    thread::spawn(move || {
+        let mut addr: Addr = unsafe { std::mem::zeroed() };
+        while recv(fh, &mut [], &mut 0, &mut addr) {
+            on_flow(&mut flows.flows.lock().unwrap(), &addr);
+        }
+    });
+
     let now = Instant::now();
     let lanes = limits.map(|limit| {
         limit.map(|rate| Lane {
@@ -227,42 +330,45 @@ pub fn shape(flows: Flows, target: Arc<AtomicU32>, limits: [Option<u64>; 2]) -> 
     });
     let shared = Arc::new((Mutex::new(lanes), Condvar::new()));
 
-    let rx = shared.clone();
+    let (rx, rx_engine) = (shared.clone(), engine.clone());
     thread::spawn(move || {
+        let engine = rx_engine;
         let mut buf = vec![0u8; 65_535];
         let mut addr: Addr = unsafe { std::mem::zeroed() };
         let mut len = 0u32;
         while recv(h, &mut buf, &mut len, &mut addr) {
             let packet = &buf[..len as usize];
-            let pid = packet_key(packet, addr.outbound()).and_then(|key| flows.lock().unwrap().get(&key).copied());
+            let pid = engine.pid(packet_key(packet, addr.outbound()));
             let mut lanes = rx.0.lock().unwrap();
             match &mut lanes[addr.outbound() as usize] {
-                Some(lane) if pid.is_some_and(|pid| pid == target.load(Ordering::Relaxed)) => {
+                Some(lane) if pid != 0 && pid == engine.target.load(Ordering::Relaxed) => {
                     if lane.bytes + packet.len() <= lane.cap {
                         lane.bytes += packet.len();
-                        lane.queue.push_back((packet.to_vec(), addr));
+                        lane.queue.push_back((packet.to_vec(), addr, pid));
                         rx.1.notify_one();
                     }
                 }
-                _ => send(h, packet, &addr),
+                _ => engine.pass(h, packet, &addr, pid),
             }
         }
     });
 
+    let tx_engine = engine.clone();
     thread::spawn(move || {
+        let engine = tx_engine;
         let mut lanes = shared.0.lock().unwrap();
         loop {
             let mut wait = None::<Duration>;
             for lane in lanes.iter_mut().flatten() {
-                while let Some((packet, _)) = lane.queue.front() {
+                while let Some((packet, ..)) = lane.queue.front() {
                     let w = lane.bucket.take(packet.len(), Instant::now());
                     if !w.is_zero() {
                         wait = Some(wait.map_or(w, |wait| wait.min(w)));
                         break;
                     }
-                    let (packet, addr) = lane.queue.pop_front().unwrap();
+                    let (packet, addr, pid) = lane.queue.pop_front().unwrap();
                     lane.bytes -= packet.len();
-                    send(h, &packet, &addr);
+                    engine.pass(h, &packet, &addr, pid);
                 }
             }
             lanes = match wait {
@@ -271,7 +377,7 @@ pub fn shape(flows: Flows, target: Arc<AtomicU32>, limits: [Option<u64>; 2]) -> 
             };
         }
     });
-    Ok(())
+    Ok(engine)
 }
 
 #[cfg(test)]
@@ -302,6 +408,30 @@ mod tests {
         let w = bucket.take(1, t0);
         assert!((w.as_secs_f64() - (64_000.0 - 16_384.0) / 1000.0).abs() < 1e-6);
         assert!(bucket.take(1, t0 + w).is_zero());
+    }
+
+    #[test]
+    fn merge_sums_by_path_and_resets_rates() {
+        let mut apps = BTreeMap::new();
+        let exe = r"C:\Apps\Browser.exe".to_string();
+        let tick1 = [(exe.clone(), [100, 10]), (exe.clone(), [50, 5]), (SYSTEM.into(), [7, 0])];
+        let stats = merge(&mut apps, tick1.into_iter());
+        assert_eq!(stats.len(), 2);
+        let browser = &apps[&exe];
+        assert_eq!((browser.name.as_str(), browser.down_bps, browser.up_bps), ("Browser", 150, 15));
+        assert_eq!(apps[SYSTEM].name, "System / unknown");
+
+        merge(&mut apps, [(exe.clone(), [1, 0])].into_iter());
+        let browser = &apps[&exe];
+        assert_eq!((browser.down_bps, browser.down_total, browser.up_bps, browser.up_total), (1, 151, 0, 15));
+        assert_eq!((apps[SYSTEM].down_bps, apps[SYSTEM].down_total), (0, 7));
+    }
+
+    #[test]
+    fn port_owners_reads_os_tables() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        assert_eq!(port_owners().get(&(17, port)), Some(&std::process::id()));
     }
 
     /// FLOW-layer Addr in WinDivert's host-order, IPv4-mapped form.
@@ -363,10 +493,18 @@ mod tests {
     fn spike_download_shaping() {
         const LIMIT: f64 = 1_000_000.0;
         const URL: &str = "https://speed.cloudflare.com/__down?bytes=20000000";
-        let flows = Flows::default();
-        let target = Arc::new(AtomicU32::new(0));
-        track_flows(flows.clone()).unwrap();
-        shape(flows.clone(), target.clone(), [Some(LIMIT as u64), None]).unwrap();
+        let engine = start([Some(LIMIT as u64), None]).unwrap();
+        let (flows, target) = (&engine.flows, &engine.target);
+        let mut apps = BTreeMap::new();
+
+        // Idle cost + what the monitor sees over 10 s of normal background traffic.
+        let (cpu0, t0) = (cpu_seconds(), Instant::now());
+        thread::sleep(Duration::from_secs(10));
+        let idle = (cpu_seconds() - cpu0) / t0.elapsed().as_secs_f64();
+        let seen = engine.tick(&mut apps);
+        for app in &seen {
+            println!("IDLE {:>10} B down {:>10} B up  {}", app.down_total, app.up_total, app.path);
+        }
 
         let curl = |shaped: bool| {
             let child = std::process::Command::new("curl.exe")
@@ -389,11 +527,23 @@ mod tests {
             (v[0], v[1], v[2], attributed, path)
         };
 
+        let (cpu0, t0) = (cpu_seconds(), Instant::now());
         let base = curl(false);
+        let full = (cpu_seconds() - cpu0) / t0.elapsed().as_secs_f64();
+        let curl_total = engine
+            .tick(&mut apps)
+            .into_iter()
+            .find(|app| app.path.to_lowercase().ends_with("curl.exe"))
+            .map_or(0, |app| app.down_total);
         let (cpu0, t0) = (cpu_seconds(), Instant::now());
         let shaped = curl(true);
         let cpu = (cpu_seconds() - cpu0) / t0.elapsed().as_secs_f64();
         let cores = thread::available_parallelism().map_or(1, |n| n.get());
+        println!(
+            "MONITOR curl counted {curl_total} B down for a 20,000,000 B body; CPU idle {:.2}% / full speed {:.1}% of one core",
+            idle * 100.0,
+            full * 100.0,
+        );
         println!(
             "SPIKE base {:.0} B/s; shaped {:.0} B/s = {:+.1}% vs {LIMIT} limit, total {:.1}s, ttfb {:.2}s; \
              attributed {} {:?}; engine CPU {:.1}% of one core ({:.2}% of {cores})",
@@ -408,6 +558,7 @@ mod tests {
             cpu * 100.0 / cores as f64,
         );
         assert!(shaped.3, "curl flow not attributed");
+        assert!((20_000_000..22_000_000).contains(&curl_total), "monitor miscounted curl");
         assert!((shaped.0 / LIMIT - 1.0).abs() <= 0.2, "rate off by more than 20%");
     }
 
