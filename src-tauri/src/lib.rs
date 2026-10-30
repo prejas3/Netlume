@@ -119,7 +119,10 @@ fn emit_stats(app: AppHandle, engine: Arc<engine::Engine>, storage: Arc<Storage>
         let mut ticks = 0;
         loop {
             thread::sleep(Duration::from_secs(1));
-            let stats = engine.tick(&mut apps);
+            let mut stats = engine.tick(&mut apps);
+            if let Ok(rules) = app.state::<AppState>().rules.lock() {
+                apply_rules(&mut stats, &rules);
+            }
             let _ = storage.record(&today(), &stats);
             ticks += 1;
             if ticks % 60 == 0 {
@@ -130,6 +133,16 @@ fn emit_stats(app: AppHandle, engine: Arc<engine::Engine>, storage: Arc<Storage>
             }
         }
     });
+}
+
+fn apply_rules(stats: &mut [AppStat], rules: &Rules) {
+    for stat in stats {
+        let rule = rules.apps.get(&stat.path);
+        stat.limit = rule
+            .map(|rule| rule.limit.clone())
+            .filter(|limit| limit.down_bps.is_some() || limit.up_bps.is_some());
+        stat.blocked = rule.is_some_and(|rule| rule.blocked);
+    }
 }
 
 pub fn run() {
@@ -223,4 +236,31 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Netlume");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::AppRule;
+
+    #[test]
+    fn persisted_app_rules_are_visible_in_stats() {
+        let mut rules = Rules::default();
+        rules.apps.insert(
+            "browser.exe".into(),
+            AppRule {
+                limit: Limit { down_bps: Some(1_000_000), up_bps: None },
+                blocked: true,
+            },
+        );
+        let mut stats = vec![AppStat {
+            id: "browser.exe".into(), name: "browser".into(), path: "browser.exe".into(),
+            down_bps: 0, up_bps: 0, down_total: 0, up_total: 0, limit: None, blocked: false,
+        }];
+
+        apply_rules(&mut stats, &rules);
+
+        assert_eq!(stats[0].limit.as_ref().unwrap().down_bps, Some(1_000_000));
+        assert!(stats[0].blocked);
+    }
 }
