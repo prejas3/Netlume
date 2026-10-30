@@ -1,5 +1,5 @@
-# CCS/1 fetch WinDivert 2.2.2 x64 (LGPL-3.0) into src-tauri/windivert; refuses unsigned driver/dll.
-# ponytail: GitHub publishes no digest for this zip; Authenticode on .sys/.dll is the check.
+# CCS/1 fetch WinDivert 2.2.2 x64 (LGPL-3.0) into src-tauri/windivert; refuses changed files or unsigned driver.
+# GitHub publishes no digest and upstream signs only the .sys: hashes pinned from the official release, 2026-10-30.
 $ErrorActionPreference = 'Stop'
 $dir = Join-Path $PSScriptRoot 'windivert'
 $zip = Join-Path $dir 'WinDivert-2.2.2-A.zip'
@@ -13,8 +13,12 @@ try {
         [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $dir (Split-Path $name -Leaf)), $true)
     }
 } finally { $archive.Dispose(); Remove-Item $zip }
-foreach ($file in 'WinDivert.dll', 'WinDivert64.sys') {
-    $sig = Get-AuthenticodeSignature (Join-Path $dir $file)
-    if ($sig.Status -ne 'Valid') { throw "$file signature: $($sig.Status)" }
-    "$file signed by $($sig.SignerCertificate.Subject)"
+$pinned = @{
+    'WinDivert.dll'   = 'C1E060EE19444A259B2162F8AF0F3FE8C4428A1C6F694DCE20DE194AC8D7D9A2'
+    'WinDivert64.sys' = '8DA085332782708D8767BCACE5327A6EC7283C17CFB85E40B03CD2323A90DDC2'
 }
+foreach ($file in $pinned.Keys) {
+    if ((Get-FileHash (Join-Path $dir $file)).Hash -ne $pinned[$file]) { throw "$file hash mismatch" }
+}
+$sig = Get-AuthenticodeSignature (Join-Path $dir 'WinDivert64.sys')
+if ($sig.Status -ne 'Valid') { throw "WinDivert64.sys signature: $($sig.Status)" }
