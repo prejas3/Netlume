@@ -31,6 +31,7 @@ document.body.innerHTML = `
       <button class="pause-control" id="pauseControl" role="switch" aria-checked="false">
         <span class="pause-glyph" aria-hidden="true"></span><span id="pauseLabel">Pause limits</span>
       </button>
+      <div class="pause-banner" id="pauseBanner" hidden>Limits paused · traffic is unrestricted</div>
     </header>
 
     <section class="live-view" id="liveView">
@@ -258,6 +259,7 @@ function currentGlobalLimit(): Limit { return state.limits.get("global") ?? { do
 function renderPause() {
   const button = byId<HTMLButtonElement>("pauseControl"); button.ariaChecked = String(state.paused);
   button.classList.toggle("is-paused", state.paused);
+  byId("pauseBanner").hidden = !state.paused;
   byId("pauseLabel").textContent = state.paused ? "Resume limits" : "Pause limits";
 }
 

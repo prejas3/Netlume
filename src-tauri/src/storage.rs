@@ -43,11 +43,15 @@ impl Storage {
     }
 
     pub fn load_rules(&self) -> io::Result<Rules> {
-        read_json(&self.root.join("rules.json"))
+        let mut rules: Rules = read_json(&self.root.join("rules.json"))?;
+        rules.global.paused = false;
+        Ok(rules)
     }
 
     pub fn save_rules(&self, rules: &Rules) -> io::Result<()> {
-        write_json(&self.root.join("rules.json"), rules)
+        let mut persisted = rules.clone();
+        persisted.global.paused = false;
+        write_json(&self.root.join("rules.json"), &persisted)
     }
 
     pub fn record(&self, day: &str, live: &[AppStat]) -> io::Result<()> {
@@ -173,11 +177,11 @@ mod tests {
                 blocked: true,
             },
         );
+        rules.global.paused = true;
         storage.save_rules(&rules).unwrap();
-        assert_eq!(
-            storage.load_rules().unwrap().apps["a.exe"].limit.down_bps,
-            Some(12)
-        );
+        let loaded = storage.load_rules().unwrap();
+        assert_eq!(loaded.apps["a.exe"].limit.down_bps, Some(12));
+        assert!(!loaded.global.paused);
         fs::remove_dir_all(root).unwrap();
     }
 
