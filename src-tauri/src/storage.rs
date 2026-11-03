@@ -19,6 +19,9 @@ pub struct AppRule {
 pub struct Rules {
     pub apps: BTreeMap<String, AppRule>,
     pub global: Global,
+    /// "pl" or "en" once chosen in Settings; unset follows the Windows display language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
 }
 
 #[derive(Default)]
@@ -178,10 +181,15 @@ mod tests {
             },
         );
         rules.global.paused = true;
+        rules.lang = Some("en".into());
         storage.save_rules(&rules).unwrap();
         let loaded = storage.load_rules().unwrap();
         assert_eq!(loaded.apps["a.exe"].limit.down_bps, Some(12));
         assert!(!loaded.global.paused);
+        assert_eq!(loaded.lang.as_deref(), Some("en"));
+        // 0.2.0 files have no language: they still load and follow Windows.
+        fs::write(root.join("rules.json"), r#"{"apps":{},"global":{"limit":{"down_bps":null,"up_bps":null},"paused":false}}"#).unwrap();
+        assert_eq!(storage.load_rules().unwrap().lang, None);
         fs::remove_dir_all(root).unwrap();
     }
 

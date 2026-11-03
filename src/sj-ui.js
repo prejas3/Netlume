@@ -45,7 +45,12 @@ export function select({ options, value, label, onChange }) {
       active = i; items.forEach((item, n) => item.classList.toggle("is-active", n === i));
       list.setAttribute("aria-activedescendant", items[i].id);
     }
-    function close() { list.remove(); removeEventListener("pointerdown", outside, true); button.focus(); }
+    let open = true;
+    // Removing the focused list fires focusout, which calls close() again: run once.
+    function close() {
+      if (!open) return; open = false;
+      removeEventListener("pointerdown", outside, true); list.remove(); button.focus();
+    }
     function choose(i) {
       close();
       if (options[i].value !== button.value) { button.value = options[i].value; render(); onChange(button.value); }

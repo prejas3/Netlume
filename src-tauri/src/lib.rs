@@ -70,8 +70,20 @@ fn system_lang() -> &'static str {
 }
 
 #[tauri::command]
+fn get_language(state: State<'_, AppState>) -> Result<String, String> {
+    state.lang.lock().map(|lang| lang.clone()).map_err(|error| error.to_string())
+}
+
+/// Saves the Settings choice; the window and the tray both read it back on start.
+#[tauri::command]
 fn set_language(lang: String, state: State<'_, AppState>) -> Result<(), String> {
-    *state.lang.lock().map_err(|error| error.to_string())? = if lang == "pl" { "pl" } else { "en" }.into();
+    let lang = if lang == "pl" { "pl" } else { "en" };
+    *state.lang.lock().map_err(|error| error.to_string())? = lang.into();
+    {
+        let mut rules = state.rules.lock().map_err(|error| error.to_string())?;
+        rules.lang = Some(lang.into());
+        save_rules(&state, &rules)?;
+    }
     let paused = state.global.lock().map_err(|error| error.to_string())?.paused;
     label_tray(&state, paused);
     Ok(())
@@ -324,8 +336,14 @@ pub fn run() {
                     let _ = window.show();
                 }
             }
-            *state.lang.lock().map_err(|error| error.to_string())? = system_lang().into();
-            let [open, pause, start, quit] = tray_texts(system_lang(), rules.global.paused);
+            let lang = match rules.lang.as_deref() {
+                Some("pl") => "pl",
+                Some("en") => "en",
+                _ => system_lang(),
+            }
+            .to_string();
+            let [open, pause, start, quit] = tray_texts(&lang, rules.global.paused);
+            *state.lang.lock().map_err(|error| error.to_string())? = lang;
             let open = MenuItem::with_id(app, "open", open, true, None::<&str>)?;
             let pause = MenuItem::with_id(app, "pause", pause, true, None::<&str>)?;
             let start = CheckMenuItem::with_id(
@@ -422,7 +440,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             set_limit, set_block, set_global, get_global, history, get_autostart, set_autostart,
-            open_external, set_language
+            open_external, get_language, set_language
         ])
         .run(tauri::generate_context!())
         .expect("error while running Netlume");
