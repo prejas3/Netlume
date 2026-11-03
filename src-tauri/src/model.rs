@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-// CCS/1 IO: commands=set_limit,set_block,set_global,get_global,history | events=stats,global
+// CCS/1 IO: commands=set_limit,set_block,set_global,get_global,history,get_autostart,set_autostart(on)->bool,open_external(https url|"data") | events=stats,global
 pub const STATS_EVENT: &str = "stats";
 pub const GLOBAL_EVENT: &str = "global";
 

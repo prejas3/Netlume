@@ -25,6 +25,8 @@ struct AppState {
     storage: OnceLock<Arc<Storage>>,
     /// Unset when the engine can't start (unelevated UI dev): commands still persist.
     engine: OnceLock<Arc<engine::Engine>>,
+    /// Tray's "Start with Windows" item, kept in step with the Settings toggle.
+    autostart_item: OnceLock<CheckMenuItem<tauri::Wry>>,
 }
 
 #[tauri::command]
@@ -80,6 +82,44 @@ fn history(day: String, state: State<'_, AppState>) -> Result<Vec<AppStat>, Stri
         .ok_or("storage unavailable")?
         .history(&day)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_autostart() -> bool {
+    autostart_enabled()
+}
+
+#[tauri::command]
+fn set_autostart(on: bool, state: State<'_, AppState>) -> Result<bool, String> {
+    let result = write_autostart(on);
+    let enabled = autostart_enabled();
+    if let Some(item) = state.autostart_item.get() {
+        let _ = item.set_checked(enabled);
+    }
+    result.map(|()| enabled)
+}
+
+/// Opens an https link in the default browser, or "data" for the data folder.
+#[tauri::command]
+fn open_external(target: String) -> Result<(), String> {
+    let target = if target == "data" {
+        data_root()?.to_string_lossy().into_owned()
+    } else if target.starts_with("https://") && !target.contains('"') {
+        target
+    } else {
+        return Err("unsupported target".into());
+    };
+    std::process::Command::new("explorer.exe")
+        .arg(target)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn data_root() -> Result<PathBuf, String> {
+    std::env::var_os("APPDATA")
+        .map(|root| PathBuf::from(root).join("Netlume"))
+        .ok_or_else(|| "APPDATA is unavailable".into())
 }
 
 fn save_rules(state: &AppState, rules: &Rules) -> Result<(), String> {
@@ -165,7 +205,7 @@ fn autostart_enabled() -> bool {
 
 /// Logon task at highest privileges: elevated start with no UAC prompt. XML, not schtasks flags,
 /// because flag-made tasks die after 72 h and skip on battery.
-fn set_autostart(on: bool) -> Result<(), String> {
+fn write_autostart(on: bool) -> Result<(), String> {
     let ok = if on {
         let exe = std::env::current_exe().map_err(|error| error.to_string())?;
         let user = format!(
@@ -222,10 +262,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .setup(|app| {
-            let root = std::env::var_os("APPDATA")
-                .map(PathBuf::from)
-                .ok_or("APPDATA is unavailable")?
-                .join("Netlume");
+            let root = data_root()?;
             let storage = Arc::new(Storage::new(root)?);
             let rules = storage.load_rules().unwrap_or_default();
             let state = app.state::<AppState>();
@@ -249,6 +286,7 @@ pub fn run() {
             )?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &pause, &start, &quit])?;
+            let _ = app.state::<AppState>().autostart_item.set(start);
             let icon = app
                 .default_window_icon()
                 .cloned()
@@ -260,10 +298,12 @@ pub fn run() {
                 .on_menu_event(move |app, event| match event.id.as_ref() {
                     "autostart" => {
                         let on = autostart_enabled();
-                        if let Err(error) = set_autostart(!on) {
+                        if let Err(error) = write_autostart(!on) {
                             eprintln!("autostart: {error}");
                         }
-                        let _ = start.set_checked(autostart_enabled());
+                        if let Some(item) = app.state::<AppState>().autostart_item.get() {
+                            let _ = item.set_checked(autostart_enabled());
+                        }
                     }
                     "open" => {
                         if let Some(window) = app.get_webview_window("main") {
@@ -325,7 +365,8 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            set_limit, set_block, set_global, get_global, history
+            set_limit, set_block, set_global, get_global, history, get_autostart, set_autostart,
+            open_external
         ])
         .run(tauri::generate_context!())
         .expect("error while running Netlume");

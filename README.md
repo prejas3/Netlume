@@ -2,11 +2,13 @@
 
 Open-source per-application network monitor and bandwidth limiter for Windows 10 and 11.
 
-![Netlume](docs/screenshot.jpg)
+![Netlume, light theme](docs/screenshot.png)
+
+![Netlume, dark theme](docs/screenshot-dark.png)
 
 ## Install
 
-Download `Netlume_0.1.0_x64-setup.exe` from the releases and run it. Netlume needs administrator rights (it filters network traffic through the [WinDivert](https://github.com/basil00/WinDivert) driver), so the installer and the app ask for elevation.
+Download `Netlume_0.2.0_x64-setup.exe` from the [releases](https://github.com/prejas3/Netlume/releases) and run it. Netlume needs administrator rights (it filters network traffic through the [WinDivert](https://github.com/basil00/WinDivert) driver), so the installer and the app ask for elevation.
 
 Microsoft Defender may flag WinDivert as unwanted software (a known false positive shared by other WinDivert tools). If it quarantines `WinDivert.dll` or `WinDivert64.sys`, restore them and allow them in Windows Security.
 
@@ -17,11 +19,17 @@ Uninstall from Settings → Apps; this also removes the autostart task.
 - **Live**: every application with network traffic, its download/upload rate and session total.
 - **Limit**: set a download and/or upload limit per application, or a global limit for the whole PC.
 - **Block**: cut an application off the network.
-- **Pause limits**: lift every limit and block at once (header or tray); it resets on restart.
+- **Pause limits**: lift every limit and block at once (Live page, Settings or tray); it resets on restart.
 - **History**: daily download/upload totals per application.
-- **Tray**: open, pause all limits, *Start with Windows* (a logon task with highest privileges, so no UAC prompt), quit. Closing the window keeps Netlume running in the tray.
+- **Settings**: *Start with Windows* (a logon task with highest privileges, so no UAC prompt), language (Polski/English), theme (system/light/dark), global limit, data folder.
+- **Tray**: open, pause all limits, *Start with Windows*, quit. Closing the window keeps Netlume running in the tray.
 
 Rules and history live in `%APPDATA%\Netlume` (`rules.json`, `history\YYYY-MM-DD.json`).
+
+## Changelog
+
+- **0.2.0**: new interface on SJ Utility UI (Windows 11 look: Mica, side navigation, settings cards, light/dark theme, Polish and English), Settings and About pages.
+- **0.1.0**: first release.
 
 ## Build
 

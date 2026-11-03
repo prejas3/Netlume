@@ -16,6 +16,8 @@ Built with NSIS 3.13 (zlib/libpng; its LZMA module CPL-1.0 with a linking except
 
 ## Front end
 
+Icons: [Fluent UI System Icons](https://github.com/microsoft/fluentui-system-icons) by Microsoft, MIT licence, SVG paths copied into `src/icons.ts` and `src/sj-ui.js`.
+
 | package | version | licence |
 |---|---|---|
 | @tauri-apps/api | 2.12.4 | Apache-2.0 OR MIT |
