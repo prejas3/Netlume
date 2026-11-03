@@ -1,14 +1,15 @@
 {
   "name": "netlume",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "check:i18n": "node scripts/i18n-check.mjs"
+    "check:i18n": "node scripts/i18n-check.mjs",
+    "notices": "node scripts/third-party-notices.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2"

@@ -8,7 +8,7 @@ Open-source per-application network monitor and bandwidth limiter for Windows 10
 
 ## Install
 
-Download `Netlume_0.2.1_x64-setup.exe` from the [releases](https://github.com/prejas3/Netlume/releases) and run it. Netlume needs administrator rights (it filters network traffic through the [WinDivert](https://github.com/basil00/WinDivert) driver), so the installer and the app ask for elevation.
+Download `Netlume_0.2.2_x64-setup.exe` from the [releases](https://github.com/prejas3/Netlume/releases) and run it. Netlume needs administrator rights (it filters network traffic through the [WinDivert](https://github.com/basil00/WinDivert) driver), so the installer and the app ask for elevation.
 
 Microsoft Defender may flag WinDivert as unwanted software (a known false positive shared by other WinDivert tools). If it quarantines `WinDivert.dll` or `WinDivert64.sys`, restore them and allow them in Windows Security.
 
@@ -28,6 +28,7 @@ Rules and history live in `%APPDATA%\Netlume` (`rules.json`, `history\YYYY-MM-DD
 
 ## Changelog
 
+- **0.2.2**: Mica backdrop shows through the window again; the installer ships the full licence texts of third-party components (`THIRD_PARTY_LICENSES.txt`, Fluent UI System Icons included).
 - **0.2.1**: tray menu in Polish and English (follows the app language), new app icon.
 - **0.2.0**: new interface on SJ Utility UI (Windows 11 look: Mica, side navigation, settings cards, light/dark theme, Polish and English), Settings and About pages.
 - **0.1.0**: first release.

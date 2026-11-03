@@ -1,6 +1,6 @@
 # Third-party notices
 
-Netlume (MIT, see LICENSE) ships the components below. Licence texts: WinDivert's full LGPL-3.0/GPL-2.0 text ships as `WinDivert-LICENSE.txt` next to the app; the other licences are standard SPDX texts at https://spdx.org/licenses/.
+Netlume (MIT, see LICENSE) ships the components below. Licence texts ship next to the app: WinDivert's full LGPL-3.0/GPL-2.0 text as `WinDivert-LICENSE.txt`; every other component's own licence, copyright and notice texts in `THIRD_PARTY_LICENSES.txt` (regenerate it with `npm run notices`, sources in `licenses/` and each crate's package).
 
 ## WinDivert 2.2.2
 
@@ -16,7 +16,7 @@ Built with NSIS 3.13 (zlib/libpng; its LZMA module CPL-1.0 with a linking except
 
 ## Front end
 
-Icons: [Fluent UI System Icons](https://github.com/microsoft/fluentui-system-icons) by Microsoft, MIT licence, SVG paths copied into `src/icons.ts` and `src/sj-ui.js`.
+Icons: [Fluent UI System Icons](https://github.com/microsoft/fluentui-system-icons) by Microsoft, MIT licence (full text in `THIRD_PARTY_LICENSES.txt`), SVG paths copied into `src/icons.ts` and `src/sj-ui.js`.
 
 | package | version | licence |
 |---|---|---|
