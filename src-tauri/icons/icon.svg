@@ -1,4 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="112" fill="#101419"/>
-  <path d="M112 352V160l144 128V160h144v192L256 224v128H112Z" fill="#67e8f9"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <!-- Netlume: traffic bars held under a limit line. SJ Utility UI 10.2: 48 grid, 4 margin, accent ramp oklch(52% .14 245) / oklch(76% .12 240), no tile. -->
+  <rect x="4" y="4" width="40" height="6" rx="3" fill="#62bbf5"/>
+  <rect x="4" y="24" width="10" height="20" rx="2" fill="#006eb3"/>
+  <rect x="19" y="14" width="10" height="30" rx="2" fill="#006eb3"/>
+  <rect x="34" y="19" width="10" height="25" rx="2" fill="#006eb3"/>
 </svg>

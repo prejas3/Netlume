@@ -100,6 +100,7 @@ void (navigator as any).userAgentData?.getHighEntropyValues(["platformVersion"])
 void getVersion().then((v) => { state.version = v; if (state.page === "about") renderAbout(); });
 void invoke<boolean>("get_autostart").then((on) => { state.autostart = on; if (state.page === "settings") renderSettings(); });
 build();
+syncTrayLanguage();
 
 void listen<AppStat[]>("stats", ({ payload }) => { state.apps = payload; renderLive(); });
 void listen<Global>("global", ({ payload }) => { state.global = payload; renderGlobal(); });
@@ -380,7 +381,7 @@ function renderSettings() {
   const page = byId("settings");
   const focusedId = document.activeElement?.closest("[data-key]")?.getAttribute("data-key");
   const lang = select({ options: [{ value: "pl", label: "Polski" }, { value: "en", label: "English" }], value: state.lang, label: t.language, onChange: (v) => {
-    state.lang = v as Lang; t = state.lang === "pl" ? pl : en; store("lang", v); build(); (document.querySelector('[data-key="lang"]') as HTMLElement)?.focus();
+    state.lang = v as Lang; t = state.lang === "pl" ? pl : en; store("lang", v); build(); syncTrayLanguage(); (document.querySelector('[data-key="lang"]') as HTMLElement)?.focus();
   } });
   const theme = select({ options: (["system", "light", "dark"] as Theme[]).map((v) => ({ value: v, label: t.themes[v] })), value: state.theme, label: t.theme, onChange: (v) => {
     state.theme = v as Theme; store("theme", v); applyTheme();
@@ -408,6 +409,8 @@ function renderSettings() {
   bars();
   if (focusedId) (page.querySelector(`[data-key="${focusedId}"]`) as HTMLElement | null)?.focus();
 }
+
+function syncTrayLanguage() { void invoke("set_language", { lang: state.lang }).catch(() => {}); }
 
 function applyTheme() {
   if (state.theme === "system") delete document.documentElement.dataset.theme;

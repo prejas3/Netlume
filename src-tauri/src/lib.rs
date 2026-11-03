@@ -25,8 +25,56 @@ struct AppState {
     storage: OnceLock<Arc<Storage>>,
     /// Unset when the engine can't start (unelevated UI dev): commands still persist.
     engine: OnceLock<Arc<engine::Engine>>,
-    /// Tray's "Start with Windows" item, kept in step with the Settings toggle.
-    autostart_item: OnceLock<CheckMenuItem<tauri::Wry>>,
+    tray: OnceLock<Tray>,
+    /// "pl" or "en": the window's language, mirrored in the tray menu.
+    lang: Mutex<String>,
+}
+
+struct Tray {
+    open: MenuItem<tauri::Wry>,
+    pause: MenuItem<tauri::Wry>,
+    /// Kept in step with the Settings toggle.
+    start: CheckMenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
+}
+
+/// Tray labels: open, pause (or resume when paused), start with Windows, quit.
+fn tray_texts(lang: &str, paused: bool) -> [&'static str; 4] {
+    match (lang, paused) {
+        ("pl", false) => ["Otwórz Netlume", "Wstrzymaj wszystkie limity", "Uruchamiaj z Windows", "Zamknij"],
+        ("pl", true) => ["Otwórz Netlume", "Wznów limity", "Uruchamiaj z Windows", "Zamknij"],
+        (_, false) => ["Open Netlume", "Pause all limits", "Start with Windows", "Quit"],
+        (_, true) => ["Open Netlume", "Resume limits", "Start with Windows", "Quit"],
+    }
+}
+
+fn label_tray(state: &AppState, paused: bool) {
+    let (Some(tray), Ok(lang)) = (state.tray.get(), state.lang.lock()) else {
+        return;
+    };
+    let [open, pause, start, quit] = tray_texts(&lang, paused);
+    let _ = tray.open.set_text(open);
+    let _ = tray.pause.set_text(pause);
+    let _ = tray.start.set_text(start);
+    let _ = tray.quit.set_text(quit);
+}
+
+/// Polish when the Windows display language is Polish, else English.
+fn system_lang() -> &'static str {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetUserDefaultUILanguage() -> u16;
+    }
+    const LANG_POLISH: u16 = 0x15;
+    if unsafe { GetUserDefaultUILanguage() } & 0x3ff == LANG_POLISH { "pl" } else { "en" }
+}
+
+#[tauri::command]
+fn set_language(lang: String, state: State<'_, AppState>) -> Result<(), String> {
+    *state.lang.lock().map_err(|error| error.to_string())? = if lang == "pl" { "pl" } else { "en" }.into();
+    let paused = state.global.lock().map_err(|error| error.to_string())?.paused;
+    label_tray(&state, paused);
+    Ok(())
 }
 
 #[tauri::command]
@@ -60,6 +108,8 @@ fn set_global(global: Global, state: State<'_, AppState>, app: AppHandle) -> Res
     if let Some(engine) = state.engine.get() {
         engine.set_global(global.clone());
     }
+    drop(rules);
+    label_tray(&state, global.paused);
     app.emit(GLOBAL_EVENT, global)
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -93,8 +143,8 @@ fn get_autostart() -> bool {
 fn set_autostart(on: bool, state: State<'_, AppState>) -> Result<bool, String> {
     let result = write_autostart(on);
     let enabled = autostart_enabled();
-    if let Some(item) = state.autostart_item.get() {
-        let _ = item.set_checked(enabled);
+    if let Some(tray) = state.tray.get() {
+        let _ = tray.start.set_checked(enabled);
     }
     result.map(|()| enabled)
 }
@@ -274,19 +324,21 @@ pub fn run() {
                     let _ = window.show();
                 }
             }
-            let open = MenuItem::with_id(app, "open", "Open Netlume", true, None::<&str>)?;
-            let pause = MenuItem::with_id(app, "pause", "Pause all limits", true, None::<&str>)?;
+            *state.lang.lock().map_err(|error| error.to_string())? = system_lang().into();
+            let [open, pause, start, quit] = tray_texts(system_lang(), rules.global.paused);
+            let open = MenuItem::with_id(app, "open", open, true, None::<&str>)?;
+            let pause = MenuItem::with_id(app, "pause", pause, true, None::<&str>)?;
             let start = CheckMenuItem::with_id(
                 app,
                 "autostart",
-                "Start with Windows",
+                start,
                 true,
                 autostart_enabled(),
                 None::<&str>,
             )?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", quit, true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &pause, &start, &quit])?;
-            let _ = app.state::<AppState>().autostart_item.set(start);
+            let _ = state.tray.set(Tray { open, pause, start, quit });
             let icon = app
                 .default_window_icon()
                 .cloned()
@@ -301,8 +353,8 @@ pub fn run() {
                         if let Err(error) = write_autostart(!on) {
                             eprintln!("autostart: {error}");
                         }
-                        if let Some(item) = app.state::<AppState>().autostart_item.get() {
-                            let _ = item.set_checked(autostart_enabled());
+                        if let Some(tray) = app.state::<AppState>().tray.get() {
+                            let _ = tray.start.set_checked(autostart_enabled());
                         }
                     }
                     "open" => {
@@ -313,7 +365,7 @@ pub fn run() {
                     }
                     "pause" => {
                         if let Some(state) = app.try_state::<AppState>() {
-                            if let Ok(mut global) = state.global.lock() {
+                            let paused = if let Ok(mut global) = state.global.lock() {
                                 global.paused = !global.paused;
                                 if let Some(engine) = state.engine.get() {
                                     engine.set_global(global.clone());
@@ -325,7 +377,11 @@ pub fn run() {
                                     }
                                 }
                                 let _ = app.emit(GLOBAL_EVENT, global.clone());
-                            }
+                                global.paused
+                            } else {
+                                return;
+                            };
+                            label_tray(&state, paused);
                         }
                     }
                     "quit" => {
@@ -366,7 +422,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             set_limit, set_block, set_global, get_global, history, get_autostart, set_autostart,
-            open_external
+            open_external, set_language
         ])
         .run(tauri::generate_context!())
         .expect("error while running Netlume");
@@ -396,6 +452,13 @@ mod tests {
 
         assert_eq!(stats[0].limit.as_ref().unwrap().down_bps, Some(1_000_000));
         assert!(stats[0].blocked);
+    }
+
+    #[test]
+    fn tray_is_localised_and_ends_with_quit() {
+        assert_eq!(tray_texts("pl", false), ["Otwórz Netlume", "Wstrzymaj wszystkie limity", "Uruchamiaj z Windows", "Zamknij"]);
+        assert_eq!(tray_texts("en", true)[1], "Resume limits");
+        assert_eq!(tray_texts("de", false)[3], "Quit");
     }
 
     #[test]
